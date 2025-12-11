@@ -9,7 +9,7 @@ import fitz  # PyMuPDF
 
 
 # -------------------------
-# Normalización y parsing
+# Normalización
 # -------------------------
 def norm_txt(s: str) -> str:
     if not s:
@@ -39,7 +39,7 @@ PCT_ALONE = re.compile(r"^\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*%?\s*$")
 
 
 # -------------------------
-# Spans por coordenadas
+# Spans
 # -------------------------
 def extract_spans(page: fitz.Page) -> List[Dict]:
     d = page.get_text("dict")
@@ -63,9 +63,53 @@ def extract_spans(page: fitz.Page) -> List[Dict]:
     return spans
 
 
-def page_has(spans: List[Dict], phrase: str) -> bool:
-    p = norm_txt(phrase)
-    return any(p in sp["ntext"] for sp in spans)
+def list_pct_points(spans: List[Dict]) -> List[Tuple[float, float, float]]:
+    out = []
+    for sp in spans:
+        t = sp["text"].strip()
+        m = PCT_IN_TEXT.search(t)
+        if m:
+            v = pct_to_float(m.group(1))
+            if v is not None:
+                out.append((v, sp["x"], sp["y"]))
+                continue
+        m2 = PCT_ALONE.match(t)
+        if m2:
+            v = pct_to_float(m2.group(1))
+            if v is not None:
+                out.append((v, sp["x"], sp["y"]))
+    return out
+
+
+def find_y_of_phrase(spans: List[Dict], phrase_variants: List[str]) -> Optional[float]:
+    variants = [norm_txt(v) for v in phrase_variants]
+    ys = []
+    for sp in spans:
+        for v in variants:
+            if v in sp["ntext"]:
+                ys.append(sp["y"])
+                break
+    return min(ys) if ys else None
+
+
+def slice_block_until_fuente(spans: List[Dict], start_phrases: List[str]) -> List[Dict]:
+    """
+    Bloque = desde la primera ocurrencia de start_phrases hasta el primer "Fuente:" posterior.
+    Si no hay Fuente:, usa hasta final de página.
+    """
+    y_start = find_y_of_phrase(spans, start_phrases)
+    if y_start is None:
+        return []
+
+    # buscar fuente DESPUÉS del inicio
+    fuente_y = None
+    for sp in spans:
+        if "fuente:" in sp["ntext"] and sp["y"] > y_start:
+            fuente_y = sp["y"]
+            break
+
+    y_end = fuente_y if fuente_y is not None else (max(sp["y"] for sp in spans) + 1)
+    return [sp for sp in spans if y_start <= sp["y"] <= y_end]
 
 
 def get_delegacion(doc: fitz.Document) -> str:
@@ -81,83 +125,28 @@ def get_delegacion(doc: fitz.Document) -> str:
     return "SIN_DELEGACION"
 
 
-def find_first_y(spans: List[Dict], phrase: str) -> Optional[float]:
-    p = norm_txt(phrase)
-    ys = [sp["y"] for sp in spans if p in sp["ntext"]]
-    return min(ys) if ys else None
-
-
-def section_spans_by_titles(spans: List[Dict], start_title: str, end_titles: List[str]) -> List[Dict]:
-    """
-    Devuelve spans dentro del rango vertical (y) de una sección:
-    - inicio: primera ocurrencia de start_title
-    - fin: primera ocurrencia (más cercana hacia abajo) de cualquiera de end_titles o 'Fuente:'
-    """
-    y_start = find_first_y(spans, start_title)
-    if y_start is None:
-        return []
-
-    # candidatos a fin
-    y_candidates = []
-    for t in end_titles + ["Fuente:"]:
-        y = find_first_y(spans, t)
-        if y is not None and y > y_start:
-            y_candidates.append(y)
-
-    y_end = min(y_candidates) if y_candidates else (max(sp["y"] for sp in spans) + 1)
-
-    return [sp for sp in spans if y_start <= sp["y"] <= y_end]
-
-
-def list_pct_spans(spans: List[Dict]) -> List[Tuple[float, float, float]]:
-    """
-    Lista de (pct, x, y) detectados en spans.
-    """
-    out = []
-    for sp in spans:
-        t = sp["text"].strip()
-        m = PCT_IN_TEXT.search(t)
-        if m:
-            val = pct_to_float(m.group(1))
-            if val is not None:
-                out.append((val, sp["x"], sp["y"]))
-                continue
-        m2 = PCT_ALONE.match(t)
-        if m2:
-            val = pct_to_float(m2.group(1))
-            if val is not None:
-                out.append((val, sp["x"], sp["y"]))
-    return out
-
-
-def find_label_points(spans: List[Dict], variants: List[str], exact: bool = False) -> List[Tuple[float, float]]:
-    v = [norm_txt(x) for x in variants]
+# -------------------------
+# Match helpers
+# -------------------------
+def find_label_points(spans: List[Dict], label_variants: List[str]) -> List[Tuple[float, float]]:
+    variants = [norm_txt(v) for v in label_variants]
     pts = []
     for sp in spans:
-        for a in v:
-            if exact:
-                if sp["ntext"] == a:
-                    pts.append((sp["x"], sp["y"]))
-                    break
-            else:
-                if sp["ntext"] == a or a in sp["ntext"]:
-                    pts.append((sp["x"], sp["y"]))
-                    break
+        for v in variants:
+            # exact o contenido
+            if sp["ntext"] == v or v in sp["ntext"]:
+                pts.append((sp["x"], sp["y"]))
+                break
     return pts
 
 
-def nearest_pct_above_label(
-    spans: List[Dict],
-    label_variants: List[str],
-    max_dx: float = 180.0,
-    max_dy: float = 160.0,
-) -> Optional[float]:
+def nearest_pct_above_label(block: List[Dict], label_variants: List[str],
+                            max_dx: float = 200.0, max_dy: float = 200.0) -> Optional[float]:
     """
-    Para barras: etiqueta abajo, % arriba.
-    Busca el % con (y menor) más cercano por x.
+    Barras: etiqueta abajo y % arriba
     """
-    pts = find_label_points(spans, label_variants, exact=False)
-    pcts = list_pct_spans(spans)
+    pts = find_label_points(block, label_variants)
+    pcts = list_pct_points(block)
     if not pts or not pcts:
         return None
 
@@ -175,57 +164,67 @@ def nearest_pct_above_label(
     return best[1] if best else None
 
 
-def remove_values(all_vals: List[float], to_remove: List[Optional[float]], tol: float = 0.15) -> List[float]:
+def nearest_pct_to_label(block: List[Dict], label_variants: List[str], max_dist: float = 220.0) -> Optional[float]:
     """
-    Quita valores que ya asignamos (por tolerancia).
+    Pie/leyenda: % cerca de la etiqueta
     """
-    cleaned = all_vals[:]
-    for r in to_remove:
-        if r is None:
+    pts = find_label_points(block, label_variants)
+    pcts = list_pct_points(block)
+    if not pts or not pcts:
+        return None
+
+    best = None
+    for lx, ly in pts:
+        for val, px, py in pcts:
+            dist = math.hypot(px - lx, py - ly)
+            if dist <= max_dist:
+                if best is None or dist < best[0]:
+                    best = (dist, val)
+    return best[1] if best else None
+
+
+def remove_vals(vals: List[float], used: List[Optional[float]], tol: float = 0.2) -> List[float]:
+    out = vals[:]
+    for u in used:
+        if u is None:
             continue
-        cleaned = [v for v in cleaned if abs(v - r) > tol]
-    return cleaned
+        out = [v for v in out if abs(v - u) > tol]
+    return out
 
 
 # -------------------------
-# Extracción por bloque (FIX)
+# Extracción por sección (ANCLADA)
 # -------------------------
 def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float]]:
     out = {"perc_seguro": None, "perc_inseguro": None, "comp_menos": None, "comp_igual": None, "comp_mas": None}
 
+    anchors = ["¿se siente de seguro en su comunidad", "percepcion ciudadana"]
     for i in range(doc.page_count):
         spans = extract_spans(doc[i])
-        if not page_has(spans, "Percepción ciudadana"):
+        block = slice_block_until_fuente(spans, anchors)
+        if not block:
             continue
 
-        sec = section_spans_by_titles(
-            spans,
-            start_title="Percepción ciudadana",
-            end_titles=["Percepción del Servicio Policial", "Percepción Sector Comercial"]
-        )
-        if not sec:
-            sec = spans
+        # Comparación 2023 (barras)
+        comp_igual = nearest_pct_above_label(block, ["Igual"])
+        comp_menos = nearest_pct_above_label(block, ["Menos seguro"])
+        comp_mas = nearest_pct_above_label(block, ["Más Seguro", "Más seguro", "Mas seguro"])
 
-        # 1) Barras comparación 2023 (robusto)
-        comp_igual = nearest_pct_above_label(sec, ["Igual"])
-        comp_menos = nearest_pct_above_label(sec, ["Menos seguro"])
-        comp_mas = nearest_pct_above_label(sec, ["Más Seguro", "Más seguro", "Mas seguro"])
+        # Pie Sí/No (tomar de los % restantes del bloque hasta Fuente)
+        all_vals = [v for (v, _, _) in list_pct_points(block)]
+        all_vals = [v for v in all_vals if 0 <= v <= 100]
+        remain = remove_vals(all_vals, [comp_igual, comp_menos, comp_mas])
 
-        # 2) Pie (Sí/No) usando "resto de porcentajes" en la sección
-        all_pcts = [v for (v, _, _) in list_pct_spans(sec)]
-        all_pcts = [v for v in all_pcts if 0 <= v <= 100]
-        remain = remove_values(all_pcts, [comp_igual, comp_menos, comp_mas])
-
-        # Tomamos los 2 más “relevantes” del pie (normalmente 2 únicos)
+        # tomar 2 únicos más fuertes
         uniq = []
         for v in sorted(remain, reverse=True):
-            if all(abs(v - u) > 0.15 for u in uniq):
+            if all(abs(v - u) > 0.2 for u in uniq):
                 uniq.append(v)
-            if len(uniq) >= 2:
+            if len(uniq) == 2:
                 break
 
         if len(uniq) == 2:
-            # En estos informes: "Sí" suele ser el porcentaje menor del pie
+            # En comunidad: "No" suele ser el mayor, "Sí" el menor
             perc_inseguro = max(uniq)
             perc_seguro = min(uniq)
         else:
@@ -237,106 +236,89 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float
             "perc_inseguro": perc_inseguro,
             "comp_igual": comp_igual,
             "comp_menos": comp_menos,
-            "comp_mas": comp_mas,
+            "comp_mas": comp_mas
         })
         return out
 
     return out
 
 
-def extract_servicio_policial(doc: fitz.Document) -> Dict[str, Optional[float]]:
-    out = {
-        "fp_muy_mala": None, "fp_mala": None, "fp_regular": None, "fp_buena": None, "fp_excelente": None,
-        "ult2_peor": None, "ult2_igual": None, "ult2_mejor": None,
-    }
+def extract_fp_calificacion(doc: fitz.Document) -> Dict[str, Optional[float]]:
+    out = {"fp_muy_mala": None, "fp_mala": None, "fp_regular": None, "fp_buena": None, "fp_excelente": None}
 
-    # 1) Página/bloque de barras del servicio policial
+    anchors = ["¿como califica el servicio de fuerza publica", "percepcion del servicio policial"]
     for i in range(doc.page_count):
         spans = extract_spans(doc[i])
-        if not page_has(spans, "Percepción del Servicio Policial"):
+        block = slice_block_until_fuente(spans, anchors)
+        if not block:
             continue
 
-        sec = section_spans_by_titles(
-            spans,
-            start_title="Percepción del Servicio Policial",
-            end_titles=["Calificación del Servicio Policial de los Últimos Dos Años", "Percepción Sector Comercial"]
-        )
-        if not sec:
-            sec = spans
+        out["fp_regular"] = nearest_pct_above_label(block, ["Regular"])
+        out["fp_buena"] = nearest_pct_above_label(block, ["Buena"])
+        out["fp_excelente"] = nearest_pct_above_label(block, ["Excelente", "Muy buena", "Muy Buena"])
+        out["fp_muy_mala"] = nearest_pct_above_label(block, ["Muy mala", "Muy Mala"])
+        out["fp_mala"] = nearest_pct_above_label(block, ["Mala"])
 
-        out["fp_regular"] = nearest_pct_above_label(sec, ["Regular"])
-        out["fp_buena"] = nearest_pct_above_label(sec, ["Buena"])
-        out["fp_excelente"] = nearest_pct_above_label(sec, ["Excelente", "Muy buena", "Muy Buena"])
-        # Evita que "Mala" capture "Muy mala": primero Muy mala, luego Mala con exact más estricto
-        out["fp_muy_mala"] = nearest_pct_above_label(sec, ["Muy mala", "Muy Mala"])
-        out["fp_mala"] = nearest_pct_above_label(sec, ["Mala"])
+        return out
 
-        break
+    return out
 
-    # 2) Pie de últimos 2 años (asignación por orden de magnitud)
+
+def extract_fp_ult2(doc: fitz.Document) -> Dict[str, Optional[float]]:
+    out = {"ult2_peor": None, "ult2_igual": None, "ult2_mejor": None}
+
+    anchors = ["calificacion del servicio policial de los ultimos dos anos", "ultimos dos anos"]
     for i in range(doc.page_count):
         spans = extract_spans(doc[i])
-        if not (page_has(spans, "Últimos Dos Años") or page_has(spans, "Ultimos Dos Años")):
+        block = slice_block_until_fuente(spans, anchors)
+        if not block:
             continue
 
-        sec = section_spans_by_titles(
-            spans,
-            start_title="Últimos Dos Años",
-            end_titles=["Percepción Sector Comercial", "Percepción ciudadana"]
-        )
-        if not sec:
-            sec = spans
+        # Aquí usamos leyenda, que es lo más estable:
+        out["ult2_igual"] = nearest_pct_to_label(block, ["Igual"])
+        out["ult2_mejor"] = nearest_pct_to_label(block, ["Mejor servicio", "Mejor"])
+        out["ult2_peor"] = nearest_pct_to_label(block, ["Peor servicio", "Peor"])
 
-        vals = [v for (v, _, _) in list_pct_spans(sec)]
-        vals = [v for v in vals if 0 <= v <= 100]
+        # Fallback: si por alguna razón la leyenda no sale, tomar 3 valores únicos
+        if out["ult2_igual"] is None or out["ult2_mejor"] is None or out["ult2_peor"] is None:
+            vals = [v for (v, _, _) in list_pct_points(block)]
+            vals = [v for v in vals if 0 <= v <= 100]
+            uniq = []
+            for v in sorted(vals, reverse=True):
+                if all(abs(v - u) > 0.2 for u in uniq):
+                    uniq.append(v)
+                if len(uniq) == 3:
+                    break
+            if len(uniq) == 3:
+                out["ult2_igual"] = max(uniq)
+                out["ult2_peor"] = min(uniq)
+                out["ult2_mejor"] = sorted(uniq)[1]
 
-        # únicos (3)
-        uniq = []
-        for v in sorted(vals, reverse=True):
-            if all(abs(v - u) > 0.15 for u in uniq):
-                uniq.append(v)
-            if len(uniq) >= 3:
-                break
-
-        if len(uniq) == 3:
-            # patrón típico: Igual = mayor, Mejor = medio, Peor = menor
-            out["ult2_igual"] = max(uniq)
-            out["ult2_peor"] = min(uniq)
-            mid = sorted(uniq)[1]
-            out["ult2_mejor"] = mid
-
-        break
+        return out
 
     return out
 
 
 def extract_comercio(doc: fitz.Document) -> Dict[str, Optional[float]]:
     out = {"com_seguro": None, "com_inseguro": None}
-
+    anchors = ["¿se siente seguro en su establecimiento comercial", "percepcion sector comercial"]
     for i in range(doc.page_count):
         spans = extract_spans(doc[i])
-        if not page_has(spans, "Percepción Sector Comercial"):
+        block = slice_block_until_fuente(spans, anchors)
+        if not block:
             continue
 
-        sec = section_spans_by_titles(
-            spans,
-            start_title="Percepción Sector Comercial",
-            end_titles=[]
-        )
-        if not sec:
-            sec = spans
-
-        # Pie: dos porcentajes, asignamos seguro=min? NO: en comercio "Sí" suele ser mayor (66.24)
-        vals = [v for (v, _, _) in list_pct_spans(sec)]
+        vals = [v for (v, _, _) in list_pct_points(block)]
         vals = [v for v in vals if 0 <= v <= 100]
         uniq = []
         for v in sorted(vals, reverse=True):
-            if all(abs(v - u) > 0.15 for u in uniq):
+            if all(abs(v - u) > 0.2 for u in uniq):
                 uniq.append(v)
-            if len(uniq) >= 2:
+            if len(uniq) == 2:
                 break
 
         if len(uniq) == 2:
+            # En comercio: "Sí" suele ser el mayor (ej 66.24)
             out["com_seguro"] = max(uniq)
             out["com_inseguro"] = min(uniq)
 
@@ -346,7 +328,7 @@ def extract_comercio(doc: fitz.Document) -> Dict[str, Optional[float]]:
 
 
 # -------------------------
-# Cálculos (tu Excel)
+# Cálculos (Excel)
 # -------------------------
 def weighted_score(pairs: List[Tuple[Optional[float], float]]) -> Optional[float]:
     ok = [(p, w) for p, w in pairs if p is not None]
@@ -383,7 +365,12 @@ def calcular_indices(row: Dict[str, Optional[float]]) -> Dict[str, Optional[floa
         (row.get("fp_excelente"), 1.0),
     ])
 
-    p_ult2 = weighted_score([(row.get("ult2_peor"), 0.0), (row.get("ult2_igual"), 0.5), (row.get("ult2_mejor"), 1.0)])
+    p_ult2 = weighted_score([
+        (row.get("ult2_peor"), 0.0),
+        (row.get("ult2_igual"), 0.5),
+        (row.get("ult2_mejor"), 1.0),
+    ])
+
     p_com = weighted_score([(row.get("com_inseguro"), 0.0), (row.get("com_seguro"), 1.0)])
 
     entorno_vals = [v for v in [p_perc, p_comp, p_com] if v is not None]
@@ -391,6 +378,7 @@ def calcular_indices(row: Dict[str, Optional[float]]) -> Dict[str, Optional[floa
 
     i_entorno = round(sum(entorno_vals) / len(entorno_vals), 2) if entorno_vals else None
     i_des = round(sum(des_vals) / len(des_vals), 2) if des_vals else None
+
     glob_vals = [v for v in [i_entorno, i_des] if v is not None]
     i_global = round(sum(glob_vals) / len(glob_vals), 2) if glob_vals else None
 
@@ -408,10 +396,10 @@ def calcular_indices(row: Dict[str, Optional[float]]) -> Dict[str, Optional[floa
 
 
 # -------------------------
-# Streamlit UI
+# UI
 # -------------------------
 st.set_page_config(page_title="Lector MPGP (PDF) — Percepción", layout="wide")
-st.title("Lector MPGP (PDF) — Percepción + Índice Global (corregido)")
+st.title("Lector MPGP (PDF) — Percepción + Índice Global (anclado a pregunta + Fuente)")
 
 uploaded = st.file_uploader("Subir PDFs", type=["pdf"], accept_multiple_files=True)
 
@@ -428,7 +416,8 @@ if uploaded:
         row = {"archivo": f.name, "delegacion": get_delegacion(doc)}
 
         row.update(extract_percepcion_ciudadana(doc))
-        row.update(extract_servicio_policial(doc))
+        row.update(extract_fp_calificacion(doc))
+        row.update(extract_fp_ult2(doc))
         row.update(extract_comercio(doc))
         row.update(calcular_indices(row))
 
