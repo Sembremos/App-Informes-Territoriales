@@ -76,7 +76,7 @@ def unique_top(vals: List[float], k: int, tol: float = 0.2) -> List[float]:
 
 
 # =========================
-# Spans / lines (para Hatillo y similares)
+# Spans / lines (para Hatillo)
 # =========================
 def get_spans(page: fitz.Page) -> List[Dict]:
     d = page.get_text("dict")
@@ -145,10 +145,9 @@ def slice_until_fuente(spans: List[Dict], y_start: float) -> List[Dict]:
 
 
 # =========================
-# Modo 1: Hatillo (etiqueta debajo de barra)
+# Modo 1: Hatillo (etiquetas debajo de barras)
 # =========================
 def extract_comp_by_labels(page: fitz.Page, spans: List[Dict], lines: List[Dict], midx: float, y_start: float, block_right: List[Dict]) -> Dict[str, Optional[float]]:
-    # líneas en el lado derecho y dentro del bloque
     y_max = max(sp["cy"] for sp in block_right) if block_right else y_start + 9999
     right_lines = [ln for ln in lines if ln["cx"] >= midx and (y_start <= ln["cy"] <= y_max + 10)]
 
@@ -163,14 +162,12 @@ def extract_comp_by_labels(page: fitz.Page, spans: List[Dict], lines: List[Dict]
     c_menos = find_label_line("menos seguro")
     c_mas = find_label_line("mas seguro")
 
-    # % candidatos derecha
     pct_points = []
     for sp in block_right:
         v = parse_pct(sp["text"])
         if v is not None:
             pct_points.append((v, sp["cx"], sp["cy"]))
 
-    # filtrar % arriba de etiquetas
     label_ys = [c[1] for c in [c_igual, c_menos, c_mas] if c is not None]
     if label_ys:
         base_y = max(label_ys)
@@ -178,7 +175,6 @@ def extract_comp_by_labels(page: fitz.Page, spans: List[Dict], lines: List[Dict]
     else:
         candidates = pct_points
 
-    # quitar duplicados por valor
     uniq = []
     for v, x, y in sorted(candidates, key=lambda t: (t[0], t[2])):
         if all(abs(v - u[0]) > 0.2 for u in uniq):
@@ -214,7 +210,6 @@ def extract_comp_by_labels(page: fitz.Page, spans: List[Dict], lines: List[Dict]
             used.add(b[1])
             got[key] = b[2]
 
-    # fallback con top3
     top3 = unique_top([v for v, _, _ in uniq], 3)
     current = [v for v in got.values() if v is not None]
     if len(labels) == 3 and len(current) == 2 and len(top3) == 3:
@@ -238,10 +233,9 @@ def extract_comp_by_labels(page: fitz.Page, spans: List[Dict], lines: List[Dict]
 
 
 # =========================
-# Modo 2: Leyenda por color (caso Alajuela / etiquetas en leyenda)
+# Modo 2: Leyenda por color (CORREGIDO)
 # =========================
 def rgb_tuple(c):
-    # fitz devuelve float 0..1 o None
     if c is None:
         return None
     if isinstance(c, (list, tuple)) and len(c) >= 3:
@@ -254,10 +248,15 @@ def color_dist(a, b) -> float:
 
 
 def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Optional[float]]:
-    # palabras con posiciones
     words = page.get_text("words")  # x0,y0,x1,y1,word,block,line,wordno
 
-    # drawings: rectángulos rellenos
+    # helper words centers
+    words2 = []
+    for (x0, y0, x1, y1, w, *_rest) in words:
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        words2.append((x0, y0, x1, y1, cx, cy, w))
+
     drawings = page.get_drawings()
     filled_rects = []
     for d in drawings:
@@ -265,13 +264,11 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
         if fill is None:
             continue
         for it in d.get("items", []):
-            # it: ("re", rect, ...) para rectángulos
             if not it:
                 continue
             if it[0] != "re":
                 continue
             rect = it[1]
-            # filtrar al bloque derecho (comparación)
             if rect.x1 < midx:
                 continue
             if rect.y1 < y_start or rect.y0 > y_end:
@@ -287,18 +284,16 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
             "Comparación 2023 - Más seguro (%)": None,
         }
 
-    # separar “cuadritos” de leyenda vs “barras”
-    # leyenda: rect pequeños (~10-30 px) cerca de la parte baja del bloque
-    # barras: rect altos
     legend_rects = []
     bar_rects = []
     for rect, fill, w, h in filled_rects:
-        if w < 40 and h < 40 and rect.y0 > (y_end - 260):
+        # leyenda: cuadrito pequeño y abajo
+        if w < 45 and h < 45 and rect.y0 > (y_end - 320):
             legend_rects.append((rect, fill))
-        elif h > 80 and w > 15:
+        # barras: rect alto
+        elif h > 80 and w > 15 and rect.y0 > (y_start + 40):
             bar_rects.append((rect, fill))
 
-    # si no detectó leyenda, no podemos mapear colores
     if not legend_rects or not bar_rects:
         return {
             "Comparación 2023 - Igual (%)": None,
@@ -306,23 +301,29 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
             "Comparación 2023 - Más seguro (%)": None,
         }
 
-    # leer texto a la derecha de cada cuadrito de leyenda
-    # armamos mapa: color_legend -> categoria
+    # --- CORRECCIÓN CLAVE ---
+    # En vez de una caja grande, tomamos SOLO palabras cuya cy esté cerca del cy del cuadrito
+    def legend_label_for_rect(rect) -> str:
+        cy0 = (rect.y0 + rect.y1) / 2.0
+        x_min = rect.x1 + 4
+        x_max = rect.x1 + 260
+        band = 12  # estricto para no comerse otras líneas
+
+        line_words = []
+        for (x0, y0, x1, y1, cx, cy, w) in words2:
+            if x0 < x_min or x1 > x_max:
+                continue
+            if abs(cy - cy0) > band:
+                continue
+            line_words.append((x0, w))
+
+        line_words.sort(key=lambda t: t[0])
+        return norm(" ".join(w for _, w in line_words))
+
+    # mapa color_leyenda -> categoria
     color_to_cat = {}
     for rect, fill in legend_rects:
-        # buscar palabras en una franja horizontal a la derecha del cuadrito
-        x_min = rect.x1 + 3
-        x_max = rect.x1 + 240
-        y_min = rect.y0 - 10
-        y_max = rect.y1 + 10
-
-        txt = []
-        for (x0, y0, x1, y1, w, *_rest) in words:
-            if x0 >= x_min and x1 <= x_max and y0 >= y_min and y1 <= y_max:
-                txt.append(w)
-        label = norm(" ".join(txt))
-
-        # normalizar categorías posibles
+        label = legend_label_for_rect(rect)
         cat = None
         if "igual" in label:
             cat = "igual"
@@ -332,7 +333,7 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
             cat = "menos"
 
         if cat:
-            # si hay colores parecidos repetidos, guardamos el primero; luego escogemos por distancia
+            # guardamos el color asociado a esa categoría
             color_to_cat[fill] = cat
 
     if not color_to_cat:
@@ -342,66 +343,58 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
             "Comparación 2023 - Más seguro (%)": None,
         }
 
-    # obtener % del lado derecho en el bloque (texto), con su x,y
+    # % en el bloque derecho
     pct_points = []
-    for (x0, y0, x1, y1, w, *_rest) in words:
+    for (x0, y0, x1, y1, cx, cy, w) in words2:
         v = parse_pct(w)
         if v is None:
             continue
-        # restringimos al bloque de comparación (derecha)
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
         if cx < midx:
             continue
         if cy < y_start or cy > y_end:
             continue
         pct_points.append((v, cx, cy))
 
-    # quitar duplicados por valor (por si el PDF repite)
     uniq_pcts = []
     for v, x, y in sorted(pct_points, key=lambda t: (t[0], t[2])):
         if all(abs(v - u[0]) > 0.2 for u in uniq_pcts):
             uniq_pcts.append((v, x, y))
 
-    # asignar: para cada barra, buscar % más cercano arriba de la barra
-    results = {"igual": None, "menos": None, "mas": None}
-
+    # asignación color barra -> categoria (por distancia con el color de leyenda)
     def nearest_cat(fill):
-        # emparejar el color de barra con el color de leyenda más cercano
         best = None
         for c_leg, cat in color_to_cat.items():
             d = color_dist(fill, c_leg)
             if best is None or d < best[0]:
                 best = (d, cat)
-        # umbral suave
         return best[1] if best and best[0] < 0.35 else None
 
+    results = {"igual": None, "menos": None, "mas": None}
+
+    # para cada barra: buscar % arriba cercano al centro X de la barra
     for rect, fill in bar_rects:
         cat = nearest_cat(fill)
         if not cat:
             continue
 
-        # buscar % arriba (y < rect.y0) y cercano en X al centro de la barra
         bx = (rect.x0 + rect.x1) / 2.0
         best = None
         for (v, x, y) in uniq_pcts:
             if y >= rect.y0:
                 continue
-            if y < rect.y0 - 260:
+            if y < rect.y0 - 280:
                 continue
             dx = abs(x - bx)
-            if dx > 160:
+            if dx > 170:
                 continue
             score = dx + (rect.y0 - y) * 0.05
             if best is None or score < best[0]:
                 best = (score, v)
 
-        if best:
-            # si hay dos barras del mismo color (no debería), dejamos la que no esté asignada
-            if results[cat] is None:
-                results[cat] = best[1]
+        if best and results[cat] is None:
+            results[cat] = best[1]
 
-    # fallback: si falta alguno, completar con top3 detectados por texto
+    # fallback top3
     top3 = unique_top([v for v, _, _ in uniq_pcts], 3)
     got = [v for v in results.values() if v is not None]
     if len(top3) == 3 and len(got) == 2:
@@ -419,18 +412,19 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
 
 
 def comp_values_ok(comp: Dict[str, Optional[float]]) -> bool:
-    vals = [comp.get("Comparación 2023 - Igual (%)"),
-            comp.get("Comparación 2023 - Menos seguro (%)"),
-            comp.get("Comparación 2023 - Más seguro (%)")]
+    vals = [
+        comp.get("Comparación 2023 - Igual (%)"),
+        comp.get("Comparación 2023 - Menos seguro (%)"),
+        comp.get("Comparación 2023 - Más seguro (%)"),
+    ]
     if any(v is None for v in vals):
         return False
-    # deben sumar ~100 (tolerancia por OCR/texto / redondeos en PDF)
     s = sum(vals)
     return 97.0 <= s <= 103.0
 
 
 # =========================
-# Extracción principal (solo datos que pediste)
+# Extracción principal
 # =========================
 def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
     out = {
@@ -450,7 +444,6 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
     spans = get_spans(page)
     lines = build_lines_from_dict(page)
 
-    # ancla vertical
     y_start = None
     for ln in lines:
         if "percepcion ciudadana" in ln["ntext"]:
@@ -461,13 +454,12 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
 
     block = slice_until_fuente(spans, y_start)
 
-    # dividir izquierda/derecha
     w = page.rect.width
     midx = w * 0.52
     left = [sp for sp in block if sp["cx"] < midx]
     right = [sp for sp in block if sp["cx"] >= midx]
 
-    # PIE izquierda: 2 % principales
+    # PIE
     left_pcts = []
     for sp in left:
         v = parse_pct(sp["text"])
@@ -479,25 +471,23 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
         out["Inseguro en la comunidad (%)"] = max(two)
         out["Seguro en la comunidad (%)"] = min(two)
 
-    # Y fin del bloque para modo leyenda
     y_end = max(sp["cy"] for sp in block) if block else page.rect.height
 
-    # Modo 1: etiquetas debajo
+    # Modo 1
     comp1 = extract_comp_by_labels(page, spans, lines, midx, y_start, right)
     if comp_values_ok(comp1):
         out.update(comp1)
         return out
 
-    # Modo 2: leyenda por color
+    # Modo 2 (corregido)
     comp2 = extract_comp_by_legend_color(page, midx, y_start, y_end)
     if comp_values_ok(comp2):
         out.update(comp2)
         return out
 
-    # Si no suma 100 pero trae valores, igual los ponemos (mejor que None)
-    # Prioridad: si comp2 tiene más datos, usar comp2
+    # fallback: el que tenga más valores
     def count_vals(comp):
-        return sum(1 for k in comp.values() if isinstance(k, (int, float)))
+        return sum(1 for v in comp.values() if isinstance(v, (int, float)))
 
     out.update(comp2 if count_vals(comp2) >= count_vals(comp1) else comp1)
     return out
@@ -527,7 +517,6 @@ if files:
 
     df = pd.DataFrame(rows)
 
-    # Formato final con %
     pct_cols = [
         "Seguro en la comunidad (%)",
         "Inseguro en la comunidad (%)",
