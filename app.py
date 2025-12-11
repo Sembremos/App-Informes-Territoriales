@@ -7,9 +7,11 @@ import pandas as pd
 import streamlit as st
 
 
-# =========================
-# Helpers
-# =========================
+# =========================================================
+# Utilidades básicas
+# =========================================================
+PCT_RE = re.compile(r"(\d{1,3}[.,]\d{1,2})\s*%")
+
 def norm(s: str) -> str:
     if not s:
         return ""
@@ -21,9 +23,6 @@ def norm(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-
-PCT_RE = re.compile(r"(\d{1,3}[.,]\d{1,2})\s*%")
-
 def parse_pct(txt: str) -> Optional[float]:
     if not txt:
         return None
@@ -33,12 +32,76 @@ def parse_pct(txt: str) -> Optional[float]:
     s = m.group(1).replace(",", ".")
     try:
         v = float(s)
-        if 0 <= v <= 100:
-            return v
-        return None
+        return v if 0 <= v <= 100 else None
     except:
         return None
 
+def fmt_pct(x) -> Optional[str]:
+    if isinstance(x, (int, float)):
+        return f"{x:.2f}%"
+    return None
+
+def color_dist(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
+    return ((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) ** 0.5
+
+
+# =========================================================
+# Render + muestreo de color (CLAVE para que no falle)
+# =========================================================
+def render_page(page: fitz.Page, zoom: float = 2.0) -> Tuple[fitz.Pixmap, float]:
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return pix, zoom
+
+def sample_rgb(pix: fitz.Pixmap, x: float, y: float, radius: int = 3) -> Tuple[float, float, float]:
+    """
+    Devuelve color promedio (0..1) alrededor del punto (x,y) en coordenadas de pixmap.
+    """
+    w, h = pix.width, pix.height
+    x = int(max(0, min(w - 1, x)))
+    y = int(max(0, min(h - 1, y)))
+
+    r_sum = g_sum = b_sum = 0
+    n = 0
+
+    # pix.samples es bytes RGBRGB...
+    samples = pix.samples
+    stride = pix.stride  # bytes por fila
+
+    for dy in range(-radius, radius + 1):
+        yy = y + dy
+        if yy < 0 or yy >= h:
+            continue
+        row_start = yy * stride
+        for dx in range(-radius, radius + 1):
+            xx = x + dx
+            if xx < 0 or xx >= w:
+                continue
+            idx = row_start + xx * 3
+            r = samples[idx]
+            g = samples[idx + 1]
+            b = samples[idx + 2]
+            r_sum += r
+            g_sum += g
+            b_sum += b
+            n += 1
+
+    if n == 0:
+        return (0.0, 0.0, 0.0)
+
+    return (r_sum / n / 255.0, g_sum / n / 255.0, b_sum / n / 255.0)
+
+
+# =========================================================
+# Búsqueda de página y delegación
+# =========================================================
+def find_page_percepcion_ciudadana(doc: fitz.Document) -> Optional[int]:
+    anchors = ["percepcion ciudadana", "se siente de seguro en su comunidad"]
+    for i in range(doc.page_count):
+        t = norm(doc[i].get_text("text") or "")
+        if all(a in t for a in anchors):
+            return i
+    return None
 
 def extract_delegacion(doc: fitz.Document) -> str:
     for i in range(min(8, doc.page_count)):
@@ -49,171 +112,90 @@ def extract_delegacion(doc: fitz.Document) -> str:
     return "SIN_DELEGACIÓN"
 
 
-def page_text_norm(doc: fitz.Document, i: int) -> str:
-    return norm(doc[i].get_text("text") or "")
+# =========================================================
+# Detección de zonas y extracción
+# =========================================================
+def get_block_bounds_until_fuente(page: fitz.Page) -> Tuple[float, float]:
+    """
+    Retorna (y_start, y_end) aproximados para el bloque de Percepción ciudadana:
+    y_start = línea del título
+    y_end   = línea de 'Fuente:' si existe; si no, final de página.
+    """
+    lines = page.get_text("dict").get("blocks", [])
+    y_start = 0.0
+    found = False
 
-
-def find_page_percepcion_ciudadana(doc: fitz.Document) -> Optional[int]:
-    anchors = ["percepcion ciudadana", "se siente de seguro en su comunidad"]
-    for i in range(doc.page_count):
-        t = page_text_norm(doc, i)
-        if all(a in t for a in anchors):
-            return i
-    return None
-
-
-def unique_top(vals: List[float], k: int, tol: float = 0.2) -> List[float]:
-    out = []
-    for v in sorted(vals, reverse=True):
-        if all(abs(v - u) > tol for u in out):
-            out.append(v)
-        if len(out) >= k:
-            break
-    return out
-
-
-# =========================
-# Text spans/lines (para pie y Hatillo)
-# =========================
-def get_spans(page: fitz.Page) -> List[Dict]:
-    d = page.get_text("dict")
-    spans = []
-    for b in d.get("blocks", []):
+    # 1) encontrar y_start por "Percepción ciudadana"
+    textdict = page.get_text("dict")
+    for b in textdict.get("blocks", []):
         if b.get("type") != 0:
             continue
-        for line in b.get("lines", []):
-            for sp in line.get("spans", []):
-                text = (sp.get("text") or "").strip()
-                if not text:
-                    continue
-                x0, y0, x1, y1 = sp.get("bbox", (0, 0, 0, 0))
-                spans.append({
-                    "text": text,
-                    "ntext": norm(text),
-                    "x0": x0, "y0": y0, "x1": x1, "y1": y1,
-                    "cx": (x0 + x1) / 2.0,
-                    "cy": (y0 + y1) / 2.0,
-                })
-    return spans
-
-
-def build_lines_from_dict(page: fitz.Page) -> List[Dict]:
-    d = page.get_text("dict")
-    out = []
-    for b in d.get("blocks", []):
-        if b.get("type") != 0:
-            continue
-        for line in b.get("lines", []):
-            texts = []
-            x0s, y0s, x1s, y1s = [], [], [], []
-            cxs, cys = [], []
-            for sp in line.get("spans", []):
-                t = (sp.get("text") or "").strip()
-                if not t:
-                    continue
-                x0, y0, x1, y1 = sp.get("bbox", (0, 0, 0, 0))
-                texts.append(t)
-                x0s.append(x0); y0s.append(y0); x1s.append(x1); y1s.append(y1)
-                cxs.append((x0 + x1) / 2.0)
-                cys.append((y0 + y1) / 2.0)
-            if not texts:
-                continue
-            out.append({
-                "text": " ".join(texts),
-                "ntext": norm(" ".join(texts)),
-                "cx": sum(cxs)/len(cxs),
-                "cy": sum(cys)/len(cys),
-                "x0": min(x0s), "y0": min(y0s),
-                "x1": max(x1s), "y1": max(y1s),
-            })
-    return out
-
-
-def slice_until_fuente(spans: List[Dict], y_start: float) -> List[Dict]:
-    fuente_y = None
-    for sp in sorted(spans, key=lambda z: z["cy"]):
-        if "fuente:" in sp["ntext"] and sp["cy"] > y_start:
-            fuente_y = sp["cy"]
+        for ln in b.get("lines", []):
+            line_text = " ".join((sp.get("text") or "").strip() for sp in ln.get("spans", []) if (sp.get("text") or "").strip())
+            if "percepcion ciudadana" in norm(line_text):
+                # bbox de la línea
+                y0s = [sp["bbox"][1] for sp in ln.get("spans", []) if "bbox" in sp]
+                y1s = [sp["bbox"][3] for sp in ln.get("spans", []) if "bbox" in sp]
+                if y0s and y1s:
+                    y_start = (min(y0s) + max(y1s)) / 2.0
+                    found = True
+                    break
+        if found:
             break
-    y_end = fuente_y if fuente_y is not None else max(sp["cy"] for sp in spans) + 1
-    return [sp for sp in spans if y_start <= sp["cy"] <= y_end]
 
+    # 2) encontrar y_end por "Fuente:"
+    y_end = page.rect.height
+    words = page.get_text("words")
+    fuente_candidates = []
+    for (x0, y0, x1, y1, w, *_rest) in words:
+        if "fuente:" in norm(w):
+            cy = (y0 + y1) / 2.0
+            if cy > y_start:
+                fuente_candidates.append(cy)
+    if fuente_candidates:
+        y_end = min(fuente_candidates)
 
-# =========================
-# Modo Hatillo: etiquetas debajo
-# =========================
-def extract_comp_by_labels(page: fitz.Page, lines: List[Dict], midx: float, y_start: float, block_right: List[Dict]) -> Dict[str, Optional[float]]:
-    y_max = max(sp["cy"] for sp in block_right) if block_right else y_start + 9999
-    right_lines = [ln for ln in lines if ln["cx"] >= midx and (y_start <= ln["cy"] <= y_max + 10)]
+    return y_start, y_end
 
-    def find_label_line(needle: str) -> Optional[Tuple[float, float]]:
-        cands = [ln for ln in right_lines if needle in ln["ntext"]]
-        if not cands:
-            return None
-        cands.sort(key=lambda a: a["cy"], reverse=True)
-        return (cands[0]["cx"], cands[0]["cy"])
-
-    c_igual = find_label_line("igual")
-    c_menos = find_label_line("menos seguro")
-    c_mas = find_label_line("mas seguro")
-
-    pct_points = []
-    for sp in block_right:
-        v = parse_pct(sp["text"])
+def extract_pie_seguro_inseguro(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Toma el gráfico de pastel (lado izquierdo): devuelve (seguro, inseguro)
+    usando los 2 porcentajes más relevantes del lado izquierdo.
+    """
+    words = page.get_text("words")
+    vals = []
+    for (x0, y0, x1, y1, w, *_rest) in words:
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        if cx >= midx:
+            continue
+        if cy < y_start or cy > y_end:
+            continue
+        v = parse_pct(w)
         if v is not None:
-            pct_points.append((v, sp["cx"], sp["cy"]))
+            vals.append(v)
 
-    label_ys = [c[1] for c in [c_igual, c_menos, c_mas] if c]
-    if label_ys:
-        base_y = max(label_ys)
-        candidates = [(v, x, y) for (v, x, y) in pct_points if y < base_y and y > base_y - 350]
-    else:
-        candidates = pct_points
-
+    # quedarnos con 2 valores distintos
     uniq = []
-    for v, x, y in sorted(candidates, key=lambda t: (t[0], t[2])):
-        if all(abs(v - u[0]) > 0.2 for u in uniq):
-            uniq.append((v, x, y))
+    for v in sorted(vals, reverse=True):
+        if all(abs(v - u) > 0.2 for u in uniq):
+            uniq.append(v)
+        if len(uniq) == 2:
+            break
 
-    def best_for_label(lx, ly, used):
-        best = None
-        for i, (v, x, y) in enumerate(uniq):
-            if i in used: 
-                continue
-            if y >= ly: 
-                continue
-            dx = abs(x - lx)
-            if dx > 260:
-                continue
-            score = dx + (ly - y) * 0.05
-            if best is None or score < best[0]:
-                best = (score, i, v)
-        return best
+    if len(uniq) != 2:
+        return (None, None)
 
-    got = {"igual": None, "menos": None, "mas": None}
-    used = set()
-    for key, c in [("igual", c_igual), ("menos", c_menos), ("mas", c_mas)]:
-        if not c:
-            continue
-        b = best_for_label(c[0], c[1], used)
-        if b:
-            used.add(b[1])
-            got[key] = b[2]
+    inseguro = max(uniq)
+    seguro = min(uniq)
+    return (seguro, inseguro)
 
-    return {
-        "Comparación 2023 - Igual (%)": got["igual"],
-        "Comparación 2023 - Menos seguro (%)": got["menos"],
-        "Comparación 2023 - Más seguro (%)": got["mas"],
-    }
-
-
-# =========================
-# Modo robusto: orden por LEYENDA (texto) + barras izq→der
-# =========================
-def extract_comp_by_legend_order(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Optional[float]]:
-    words = page.get_text("words")  # x0,y0,x1,y1,word,block,line,wordno
-
-    # --- 1) leyenda: capturar posiciones de las 3 etiquetas por línea ---
+def find_legend_label_positions(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Tuple[float, float]]:
+    """
+    Encuentra coordenadas (cx,cy) de las etiquetas de leyenda:
+    igual / mas / menos (en el bloque derecho abajo).
+    """
+    words = page.get_text("words")  # incluye block,line
     by_line = {}
     for (x0, y0, x1, y1, w, b, ln, wn) in words:
         cx = (x0 + x1) / 2.0
@@ -224,98 +206,117 @@ def extract_comp_by_legend_order(page: fitz.Page, midx: float, y_start: float, y
             continue
         by_line.setdefault((b, ln), []).append((x0, y0, x1, y1, cx, cy, w))
 
-    legend_hits = []  # (cat, x, y)
+    best = {}
+    # buscamos líneas que contengan las palabras clave
     for (_b, _ln), items in by_line.items():
         items = sorted(items, key=lambda t: t[0])
         line_txt = norm(" ".join(w for *_, w in items))
         cx_line = sum(t[4] for t in items) / len(items)
         cy_line = sum(t[5] for t in items) / len(items)
 
-        # detecta categorías aunque vengan con variaciones leves
         if "igual" == line_txt or line_txt.startswith("igual "):
-            legend_hits.append(("igual", cx_line, cy_line))
+            # nos quedamos con la más baja (normalmente leyenda abajo)
+            if "igual" not in best or cy_line > best["igual"][1]:
+                best["igual"] = (cx_line, cy_line)
         if "mas seguro" in line_txt:
-            legend_hits.append(("mas", cx_line, cy_line))
+            if "mas" not in best or cy_line > best["mas"][1]:
+                best["mas"] = (cx_line, cy_line)
         if "menos seguro" in line_txt:
-            legend_hits.append(("menos", cx_line, cy_line))
+            if "menos" not in best or cy_line > best["menos"][1]:
+                best["menos"] = (cx_line, cy_line)
 
-    # dejar solo 1 por categoría (por si hay repeticiones)
-    best = {}
-    for cat, x, y in legend_hits:
-        # preferimos las que están más abajo (normalmente la leyenda va abajo del gráfico)
-        if cat not in best or y > best[cat][1]:
-            best[cat] = (x, y)
+    return best  # cat -> (cx,cy)
 
-    if len(best) < 3:
-        return {
-            "Comparación 2023 - Igual (%)": None,
-            "Comparación 2023 - Menos seguro (%)": None,
-            "Comparación 2023 - Más seguro (%)": None,
-        }
-
-    # determinar si la leyenda está vertical u horizontal
-    xs = [best[c][0] for c in ["igual", "mas", "menos"]]
-    ys = [best[c][1] for c in ["igual", "mas", "menos"]]
-    spread_x = max(xs) - min(xs)
-    spread_y = max(ys) - min(ys)
-
-    # si están casi alineadas en X → lista vertical; si no, horizontal
-    if spread_x < 70 and spread_y > 20:
-        # vertical: arriba→abajo (y menor primero)
-        legend_order = sorted(["igual", "mas", "menos"], key=lambda c: best[c][1])
-    else:
-        # horizontal: izq→der
-        legend_order = sorted(["igual", "mas", "menos"], key=lambda c: best[c][0])
-
-    # --- 2) barras: detectar 3 rectángulos altos y ordenar izq→der ---
+def find_nearest_legend_square(page: fitz.Page, target_xy: Tuple[float, float], midx: float, y_start: float, y_end: float) -> Optional[fitz.Rect]:
+    """
+    Busca un rectángulo pequeño (cuadrito) cercano a la izquierda de la etiqueta.
+    No usamos fill del vector: solo geometría. Luego muestreamos color renderizado.
+    """
+    tx, ty = target_xy
     drawings = page.get_drawings()
-    bars = []
+    candidates = []
+
     for d in drawings:
-        fill = d.get("fill")
         for it in d.get("items", []):
             if not it or it[0] != "re":
                 continue
             r = it[1]
             cx = (r.x0 + r.x1) / 2.0
             cy = (r.y0 + r.y1) / 2.0
-            if cx < midx or cy < y_start or cy > y_end:
+            if cx < midx:
+                continue
+            if cy < y_start or cy > y_end:
+                continue
+
+            w = r.x1 - r.x0
+            h = r.y1 - r.y0
+
+            # cuadrito típico
+            if w < 60 and h < 60:
+                # debe estar relativamente cerca y a la izquierda del texto
+                if cx < tx and abs(cy - ty) <= 25 and (tx - cx) <= 220:
+                    score = abs(cy - ty) * 10 + (tx - cx)
+                    candidates.append((score, r))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda t: t[0])
+    return candidates[0][1]
+
+def find_bar_rects(page: fitz.Page, midx: float, y_start: float, y_end: float) -> List[fitz.Rect]:
+    """
+    Encuentra barras (rectángulos altos) del gráfico de comparación.
+    """
+    drawings = page.get_drawings()
+    bars = []
+
+    for d in drawings:
+        for it in d.get("items", []):
+            if not it or it[0] != "re":
+                continue
+            r = it[1]
+            cx = (r.x0 + r.x1) / 2.0
+            cy = (r.y0 + r.y1) / 2.0
+            if cx < midx:
+                continue
+            if cy < y_start or cy > y_end:
                 continue
             w = r.x1 - r.x0
             h = r.y1 - r.y0
-            # barras: altas y angostas
-            if h > 90 and w > 15 and w < 240:
-                bars.append((r, cx, h))
+
+            # barras típicas
+            if h > 90 and w > 15 and w < 260:
+                bars.append((h, cx, r))
 
     if not bars:
-        return {
-            "Comparación 2023 - Igual (%)": None,
-            "Comparación 2023 - Menos seguro (%)": None,
-            "Comparación 2023 - Más seguro (%)": None,
-        }
+        return []
 
-    # tomar las 3 barras más altas (por si hay cosas extra dibujadas)
-    bars.sort(key=lambda t: t[2], reverse=True)
-    top = bars[:8]  # margen por si hay duplicados
-    # quedarnos con 3 por centros X distintos
-    picked = []
-    for r, cx, h in sorted(top, key=lambda t: t[1]):
-        if all(abs(cx - pcx) > 25 for (_r, pcx, _h) in picked):
-            picked.append((r, cx, h))
+    # ordenar por altura y elegir hasta 6 (por si hay duplicados/sombras)
+    bars.sort(key=lambda t: t[0], reverse=True)
+    top = bars[:10]
+
+    # quedarnos con 3 barras con centros X distintos
+    picked: List[fitz.Rect] = []
+    picked_cx: List[float] = []
+
+    for _h, cx, r in sorted(top, key=lambda t: t[1]):  # por x
+        if all(abs(cx - pcx) > 25 for pcx in picked_cx):
+            picked.append(r)
+            picked_cx.append(cx)
         if len(picked) == 3:
             break
 
-    if len(picked) != 3:
-        return {
-            "Comparación 2023 - Igual (%)": None,
-            "Comparación 2023 - Menos seguro (%)": None,
-            "Comparación 2023 - Más seguro (%)": None,
-        }
+    return picked
 
-    picked.sort(key=lambda t: t[1])  # izq→der
-
-    # --- 3) porcentajes: asignar a cada barra por cercanía arriba ---
+def extract_bar_percentages(page: fitz.Page, bars: List[fitz.Rect], midx: float, y_start: float, y_end: float) -> List[Optional[float]]:
+    """
+    Asigna % a cada barra usando el texto % por cercanía en X y arriba de la barra.
+    Devuelve lista [p1,p2,p3] alineada a 'bars' (mismo orden).
+    """
+    words = page.get_text("words")
     pct_points = []
-    for (x0, y0, x1, y1, w, b, ln, wn) in words:
+    for (x0, y0, x1, y1, w, *_rest) in words:
         v = parse_pct(w)
         if v is None:
             continue
@@ -331,43 +332,126 @@ def extract_comp_by_legend_order(page: fitz.Page, midx: float, y_start: float, y
         if all(abs(v - u[0]) > 0.2 for u in uniq):
             uniq.append((v, x, y))
 
-    bar_vals = []
-    for r, bx, _h in picked:
-        bestp = None
+    out = []
+    for r in bars:
+        bx = (r.x0 + r.x1) / 2.0
+        best = None
         for (v, x, y) in uniq:
+            # debe estar arriba del tope de la barra
             if y >= r.y0:
                 continue
-            if y < r.y0 - 340:
+            # ventana vertical razonable
+            if y < r.y0 - 360:
                 continue
             dx = abs(x - bx)
-            if dx > 220:
+            if dx > 230:
                 continue
             score = dx + (r.y0 - y) * 0.05
-            if bestp is None or score < bestp[0]:
-                bestp = (score, v)
-        bar_vals.append(bestp[1] if bestp else None)
+            if best is None or score < best[0]:
+                best = (score, v)
+        out.append(best[1] if best else None)
 
-    # --- 4) mapear bar izq→der a legend order ---
-    mapping = dict(zip(legend_order, bar_vals))
+    return out
+
+def extract_comp_comparison(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Optional[float]]:
+    """
+    Extrae Igual/Más/Menos correcto usando:
+    - leyenda por texto
+    - cuadritos (geom)
+    - colores renderizados reales (sampling)
+    - barras renderizadas reales (sampling)
+    - emparejar barra->categoría por distancia de color
+    """
+    # 1) posiciones de etiquetas leyenda
+    labels = find_legend_label_positions(page, midx, y_start, y_end)
+    if not all(k in labels for k in ("igual", "mas", "menos")):
+        return {
+            "Comparación 2023 - Igual (%)": None,
+            "Comparación 2023 - Más seguro (%)": None,
+            "Comparación 2023 - Menos seguro (%)": None,
+        }
+
+    # 2) encontrar cuadrito de leyenda cercano a cada etiqueta
+    sq_rects = {}
+    for cat in ("igual", "mas", "menos"):
+        sq = find_nearest_legend_square(page, labels[cat], midx, y_start, y_end)
+        sq_rects[cat] = sq
+
+    if any(sq_rects[c] is None for c in sq_rects):
+        return {
+            "Comparación 2023 - Igual (%)": None,
+            "Comparación 2023 - Más seguro (%)": None,
+            "Comparación 2023 - Menos seguro (%)": None,
+        }
+
+    # 3) render + sample colores reales de la leyenda
+    pix, zoom = render_page(page, zoom=2.0)
+
+    legend_colors = {}
+    for cat, r in sq_rects.items():
+        cx = (r.x0 + r.x1) / 2.0
+        cy = (r.y0 + r.y1) / 2.0
+        legend_colors[cat] = sample_rgb(pix, cx * zoom, cy * zoom, radius=3)
+
+    # 4) barras + sus colores reales
+    bars = find_bar_rects(page, midx, y_start, y_end)
+    if len(bars) != 3:
+        return {
+            "Comparación 2023 - Igual (%)": None,
+            "Comparación 2023 - Más seguro (%)": None,
+            "Comparación 2023 - Menos seguro (%)": None,
+        }
+
+    bar_colors = []
+    for r in bars:
+        # muestrear en el centro “dentro” de la barra (evitar bordes)
+        cx = (r.x0 + r.x1) / 2.0
+        cy = (r.y0 + r.y1) / 2.0
+        bar_colors.append(sample_rgb(pix, cx * zoom, cy * zoom, radius=4))
+
+    # 5) porcentajes por barra
+    bar_pcts = extract_bar_percentages(page, bars, midx, y_start, y_end)
+
+    # 6) asignar barra -> categoría por color (más cercano al color de leyenda)
+    assigned = {"igual": None, "mas": None, "menos": None}
+    used_bar = set()
+
+    def best_bar_for_cat(cat: str) -> Optional[int]:
+        best = None
+        for i, c in enumerate(bar_colors):
+            if i in used_bar:
+                continue
+            d = color_dist(c, legend_colors[cat])
+            if best is None or d < best[0]:
+                best = (d, i)
+        # umbral flexible: si es PDF raro, igual tomamos el más cercano
+        return best[1] if best else None
+
+    # primero asignar las 3 categorías al mejor match
+    for cat in ("igual", "mas", "menos"):
+        idx = best_bar_for_cat(cat)
+        if idx is not None:
+            used_bar.add(idx)
+            assigned[cat] = bar_pcts[idx]
 
     return {
-        "Comparación 2023 - Igual (%)": mapping.get("igual"),
-        "Comparación 2023 - Menos seguro (%)": mapping.get("menos"),
-        "Comparación 2023 - Más seguro (%)": mapping.get("mas"),
+        "Comparación 2023 - Igual (%)": assigned["igual"],
+        "Comparación 2023 - Más seguro (%)": assigned["mas"],
+        "Comparación 2023 - Menos seguro (%)": assigned["menos"],
     }
 
 
-# =========================
-# Extract principal
-# =========================
-def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
+# =========================================================
+# Extract principal (solo estos datos)
+# =========================================================
+def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float]]:
     out = {
         "Delegación": extract_delegacion(doc),
         "Seguro en la comunidad (%)": None,
         "Inseguro en la comunidad (%)": None,
         "Comparación 2023 - Igual (%)": None,
-        "Comparación 2023 - Menos seguro (%)": None,
         "Comparación 2023 - Más seguro (%)": None,
+        "Comparación 2023 - Menos seguro (%)": None,
     }
 
     pidx = find_page_percepcion_ciudadana(doc)
@@ -375,56 +459,37 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
         return out
 
     page = doc[pidx]
-    spans = get_spans(page)
-    lines = build_lines_from_dict(page)
+    y_start, y_end = get_block_bounds_until_fuente(page)
+    midx = page.rect.width * 0.52
 
-    # ancla vertical
-    y_start = None
-    for ln in lines:
-        if "percepcion ciudadana" in ln["ntext"]:
-            y_start = ln["cy"]
-            break
-    if y_start is None:
-        y_start = 0.0
+    # Pastel
+    seguro, inseguro = extract_pie_seguro_inseguro(page, midx, y_start, y_end)
+    out["Seguro en la comunidad (%)"] = seguro
+    out["Inseguro en la comunidad (%)"] = inseguro
 
-    block = slice_until_fuente(spans, y_start)
-    y_end = max(sp["cy"] for sp in block) if block else page.rect.height
-
-    w = page.rect.width
-    midx = w * 0.52
-
-    left = [sp for sp in block if sp["cx"] < midx]
-    right = [sp for sp in block if sp["cx"] >= midx]
-
-    # PIE izquierda: 2 % principales
-    left_pcts = []
-    for sp in left:
-        v = parse_pct(sp["text"])
-        if v is not None:
-            left_pcts.append(v)
-    two = unique_top(left_pcts, 2)
-    if len(two) == 2:
-        out["Inseguro en la comunidad (%)"] = max(two)
-        out["Seguro en la comunidad (%)"] = min(two)
-
-    # Modo Hatillo primero
-    comp1 = extract_comp_by_labels(page, lines, midx, y_start, right)
-    # Si comp1 trae al menos 2 valores, lo usamos; si no, modo leyenda orden
-    if sum(v is not None for v in comp1.values()) >= 2:
-        out.update(comp1)
-    else:
-        out.update(extract_comp_by_legend_order(page, midx, y_start, y_end))
+    # Barras comparación
+    comp = extract_comp_comparison(page, midx, y_start, y_end)
+    out.update(comp)
 
     return out
 
 
-# =========================
+# =========================================================
 # Streamlit UI
-# =========================
+# =========================================================
 st.set_page_config(page_title="MPGP - Extractor", layout="wide")
-st.title("MPGP — Extraer Percepción ciudadana (solo estos datos)")
+st.title("MPGP — Extractor (Percepción ciudadana)")
 
-files = st.file_uploader("Suba uno o varios PDF", type=["pdf"], accept_multiple_files=True)
+st.caption(
+    "Extrae: Seguro/Inseguro y Comparación 2023 (Igual, Más seguro, Menos seguro). "
+    "No usa OCR. Funciona aunque cambie el orden del gráfico."
+)
+
+files = st.file_uploader(
+    "Suba uno o varios PDF (pueden ser muchos)",
+    type=["pdf"],
+    accept_multiple_files=True
+)
 
 if files:
     rows = []
@@ -436,19 +501,20 @@ if files:
 
         rows.append({"Archivo": f.name, **data})
         prog.progress(int(i / len(files) * 100))
+
     prog.empty()
 
     df = pd.DataFrame(rows)
 
-    pct_cols = [
+    # Formato %
+    for col in [
         "Seguro en la comunidad (%)",
         "Inseguro en la comunidad (%)",
         "Comparación 2023 - Igual (%)",
-        "Comparación 2023 - Menos seguro (%)",
         "Comparación 2023 - Más seguro (%)",
-    ]
-    for c in pct_cols:
-        df[c] = df[c].map(lambda x: f"{x:.2f}%" if isinstance(x, (int, float)) else None)
+        "Comparación 2023 - Menos seguro (%)",
+    ]:
+        df[col] = df[col].map(fmt_pct)
 
     st.subheader("Resultados (tabla)")
     st.dataframe(df, use_container_width=True)
@@ -456,8 +522,8 @@ if files:
     st.download_button(
         "Descargar CSV",
         df.to_csv(index=False).encode("utf-8-sig"),
-        "percepcion_ciudadana.csv",
-        "text/csv",
+        file_name="percepcion_ciudadana.csv",
+        mime="text/csv",
     )
 else:
-    st.info("Cargá PDFs para extraer los datos.")
+    st.info("Cargá PDFs para ver los resultados.")
