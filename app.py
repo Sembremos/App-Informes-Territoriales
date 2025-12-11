@@ -8,7 +8,7 @@ import fitz  # PyMuPDF
 
 
 # -------------------------
-# Normalización y parsing
+# Normalización / parsing
 # -------------------------
 def norm_txt(s: str) -> str:
     if not s:
@@ -52,12 +52,14 @@ def extract_spans(page: fitz.Page) -> List[Dict]:
                 if not text:
                     continue
                 x0, y0, x1, y1 = sp.get("bbox", (0, 0, 0, 0))
-                spans.append({
-                    "text": text,
-                    "ntext": norm_txt(text),
-                    "x": (x0 + x1) / 2.0,
-                    "y": (y0 + y1) / 2.0,
-                })
+                spans.append(
+                    {
+                        "text": text,
+                        "ntext": norm_txt(text),
+                        "x": (x0 + x1) / 2.0,
+                        "y": (y0 + y1) / 2.0,
+                    }
+                )
     return spans
 
 
@@ -123,48 +125,105 @@ def extract_delegacion(doc: fitz.Document) -> str:
     return "SIN_DELEGACIÓN"
 
 
-def label_y_baseline(right_block: List[Dict]) -> Optional[float]:
-    """
-    Usa la y de las etiquetas (Igual/Menos/Más) para definir dónde están las barras arriba.
-    """
-    keys = ["igual", "menos seguro", "mas seguro", "más seguro"]
-    ys = []
+# -------------------------
+# Labels + matching robusto
+# -------------------------
+def find_label_center(right_block: List[Dict], variants: List[str]) -> Optional[Tuple[float, float]]:
+    vv = [norm_txt(v) for v in variants]
+    candidates = []
     for sp in right_block:
-        if any(k in sp["ntext"] for k in keys):
-            ys.append(sp["y"])
-    return max(ys) if ys else None
+        if any(v == sp["ntext"] or v in sp["ntext"] for v in vv):
+            candidates.append((sp["x"], sp["y"]))
+    if not candidates:
+        return None
+    # etiqueta suele estar abajo: tomar la más baja (mayor y)
+    return sorted(candidates, key=lambda t: t[1], reverse=True)[0]
 
 
-def pick_bar_percentages_by_x(right_block: List[Dict]) -> List[Tuple[float, float, float]]:
+def bar_candidates_for_label(
+    pct_points: List[Tuple[float, float, float]],
+    lx: float,
+    ly: float,
+    window_up: float = 320.0,
+    max_dx: float = 220.0,
+) -> List[Tuple[float, int]]:
     """
-    Devuelve los 3 porcentajes de las barras, ordenados por X (izq->der),
-    usando una ventana vertical arriba de las etiquetas.
+    Devuelve lista de (costo, idx_pct) para candidatos arriba de la etiqueta.
+    Costo mezcla dx y dy para preferir el % "encima" de la barra.
     """
-    base_y = label_y_baseline(right_block)
-    if base_y is None:
-        return []
+    cands = []
+    for idx, (val, px, py) in enumerate(pct_points):
+        if not (ly - window_up <= py < ly):
+            continue
+        dx = abs(px - lx)
+        if dx > max_dx:
+            continue
+        dy = abs(ly - py)
+        cost = dx * 1.0 + dy * 0.15
+        cands.append((cost, idx))
+    # mejores primero
+    cands.sort(key=lambda t: t[0])
+    return cands
 
-    pcts = list_pct_points(right_block)
 
-    # Solo porcentajes arriba de la línea de etiquetas y dentro de una ventana razonable
-    window_up = 320.0
-    cand = [(v, x, y) for (v, x, y) in pcts if (base_y - window_up) <= y < base_y]
+def solve_best_assignment(
+    pct_points: List[Tuple[float, float, float]],
+    labels: List[Tuple[str, Tuple[float, float]]],
+) -> Dict[str, Optional[float]]:
+    """
+    Asignación 1-a-1: cada etiqueta obtiene un porcentaje distinto.
+    Como solo hay 3 etiquetas, probamos combinaciones de los top candidatos.
+    """
+    # candidatos por etiqueta (top 6 para limitar búsqueda)
+    cand_lists = []
+    for col, (lx, ly) in labels:
+        c = bar_candidates_for_label(pct_points, lx, ly)
+        cand_lists.append((col, c[:6]))
 
-    # Quitar duplicados cercanos por valor, quedándonos con el más “alto” (más arriba) si repite
-    cand_sorted = sorted(cand, key=lambda t: (t[0], t[2]))  # por valor, luego por y (arriba primero)
-    uniq: List[Tuple[float, float, float]] = []
-    for v, x, y in cand_sorted:
-        if all(abs(v - u[0]) > 0.2 for u in uniq):
-            uniq.append((v, x, y))
+    best_total = None
+    best_map: Dict[str, Optional[int]] = {col: None for col, _ in labels}
 
-    # Ahora tomamos los 3 que estén más “centrados” en la zona de barras:
-    # en la práctica, ya quedan 3 (42.86, 41.56, 15.58). Si quedaran más, tomamos los 3 más grandes.
-    if len(uniq) > 3:
-        uniq = sorted(uniq, key=lambda t: t[0], reverse=True)[:3]
+    # backtracking pequeño (3 etiquetas)
+    used = set()
 
-    # Orden final por posición X (izq->der) = Igual, Menos, Más
-    uniq = sorted(uniq, key=lambda t: t[1])
-    return uniq
+    def dfs(i: int, total_cost: float, cur_map: Dict[str, Optional[int]]):
+        nonlocal best_total, best_map
+        if i == len(cand_lists):
+            if best_total is None or total_cost < best_total:
+                best_total = total_cost
+                best_map = cur_map.copy()
+            return
+
+        col, cands = cand_lists[i]
+
+        # opción: no asignar (penaliza fuerte)
+        # pero preferimos asignar si hay candidatos
+        penalty = 9999.0
+        if best_total is None or total_cost + penalty < best_total:
+            cur_map[col] = None
+            dfs(i + 1, total_cost + penalty, cur_map)
+            cur_map.pop(col, None)
+
+        for cost, idx_pct in cands:
+            if idx_pct in used:
+                continue
+            if best_total is not None and total_cost + cost >= best_total:
+                continue
+            used.add(idx_pct)
+            cur_map[col] = idx_pct
+            dfs(i + 1, total_cost + cost, cur_map)
+            cur_map.pop(col, None)
+            used.remove(idx_pct)
+
+    dfs(0, 0.0, {})
+
+    # construir salida: col -> valor
+    out: Dict[str, Optional[float]] = {}
+    for col, _ in labels:
+        idx_pct = best_map.get(col)
+        out[col] = pct_points[idx_pct][0] if isinstance(idx_pct, int) else None
+
+    return out
 
 
 # -------------------------
@@ -208,15 +267,40 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[str]]
             out["Seguro en la comunidad (%)"] = f"{seguro:.2f}%"
             out["Inseguro en la comunidad (%)"] = f"{inseguro:.2f}%"
 
-        # BARRAS (derecha): 3 valores por X
-        bars = pick_bar_percentages_by_x(right)
-        if len(bars) == 3:
-            v_igual, _, _ = bars[0]
-            v_menos, _, _ = bars[1]
-            v_mas, _, _ = bars[2]
-            out["Comparación 2023 - Igual (%)"] = f"{v_igual:.2f}%"
-            out["Comparación 2023 - Menos seguro (%)"] = f"{v_menos:.2f}%"
-            out["Comparación 2023 - Más seguro (%)"] = f"{v_mas:.2f}%"
+        # BARRAS (derecha): por etiqueta (orden no importa)
+        p_igual = find_label_center(right, ["igual"])
+        p_menos = find_label_center(right, ["menos seguro", "menosseguro"])
+        p_mas = find_label_center(right, ["mas seguro", "más seguro", "masseguro", "másseguro"])
+
+        # si falta una etiqueta, igual intentamos con las que existan
+        labels = []
+        if p_igual:
+            labels.append(("Comparación 2023 - Igual (%)", p_igual))
+        if p_menos:
+            labels.append(("Comparación 2023 - Menos seguro (%)", p_menos))
+        if p_mas:
+            labels.append(("Comparación 2023 - Más seguro (%)", p_mas))
+
+        pct_points = list_pct_points(right)
+
+        if len(labels) >= 2 and pct_points:
+            matched = solve_best_assignment(pct_points, labels)
+
+            # Si queda una etiqueta sin valor, usamos fallback con el % restante (más bajo de los 3 principales)
+            got = [v for v in matched.values() if v is not None]
+            if len(got) == len(labels) - 1:
+                all_vals = [v for (v, _, _) in pct_points]
+                uniq3 = unique_top(all_vals, 3)  # los 3 del gráfico normalmente
+                remaining = [v for v in uniq3 if all(abs(v - g) > 0.2 for g in got)]
+                if remaining:
+                    miss = remaining[0]  # normalmente queda 15.58
+                    for k in matched:
+                        if matched[k] is None:
+                            matched[k] = miss
+
+            for col, val in matched.items():
+                if val is not None:
+                    out[col] = f"{val:.2f}%"
 
         return out
 
@@ -241,15 +325,18 @@ if files:
         row["Archivo"] = f.name
         rows.append(row)
 
-    df = pd.DataFrame(rows, columns=[
-        "Archivo",
-        "Delegación",
-        "Seguro en la comunidad (%)",
-        "Inseguro en la comunidad (%)",
-        "Comparación 2023 - Igual (%)",
-        "Comparación 2023 - Menos seguro (%)",
-        "Comparación 2023 - Más seguro (%)",
-    ])
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "Archivo",
+            "Delegación",
+            "Seguro en la comunidad (%)",
+            "Inseguro en la comunidad (%)",
+            "Comparación 2023 - Igual (%)",
+            "Comparación 2023 - Menos seguro (%)",
+            "Comparación 2023 - Más seguro (%)",
+        ],
+    )
 
     st.subheader("Resultados (tabla)")
     st.dataframe(df, use_container_width=True)
