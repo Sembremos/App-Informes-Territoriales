@@ -1,6 +1,7 @@
 streamlit
 pandas
 PyMuPDF
+pdfplumber
 
 
 
