@@ -1,5 +1,4 @@
 import re
-import math
 import unicodedata
 from typing import Dict, Optional, List, Tuple
 
@@ -9,7 +8,7 @@ import fitz  # PyMuPDF
 
 
 # -------------------------
-# Helpers básicos
+# Helpers
 # -------------------------
 def norm_txt(s: str) -> str:
     if not s:
@@ -111,47 +110,13 @@ def unique_top(vals: List[float], k: int, tol: float = 0.2) -> List[float]:
     return out
 
 
-def find_label_centers(spans: List[Dict], label_variants: List[str]) -> List[Tuple[float, float]]:
-    vv = [norm_txt(v) for v in label_variants]
-    pts: List[Tuple[float, float]] = []
-    for sp in spans:
-        if any(v == sp["ntext"] or v in sp["ntext"] for v in vv):
-            pts.append((sp["x"], sp["y"]))
-    return pts
-
-
-def pick_bar_value_for_label(
-    right_block: List[Dict],
-    label_x: float,
-    label_y: float,
-    pct_points: List[Tuple[float, float, float]],
-    used_indices: set,
-    window_up: float = 260.0,
-    max_dx: float = 160.0,
-) -> Optional[Tuple[int, float]]:
-    """
-    Devuelve (index_en_pct_points, valor) del % más compatible con esa etiqueta:
-    - Debe estar arriba (y < label_y) dentro de window_up
-    - Debe estar cerca en x (dx <= max_dx)
-    - No debe estar usado
-    """
-    best = None
-    for idx, (val, px, py) in enumerate(pct_points):
-        if idx in used_indices:
-            continue
-        if not (label_y - window_up <= py < label_y):
-            continue
-        dx = abs(px - label_x)
-        if dx > max_dx:
-            continue
-        # score por cercanía horizontal (principal) y vertical (secundaria)
-        dy = abs(label_y - py)
-        score = dx * 1.0 + dy * 0.15
-        if best is None or score < best[0]:
-            best = (score, idx, val)
-    if best is None:
+def find_label_center(right_block: List[Dict], label: str) -> Optional[Tuple[float, float]]:
+    target = norm_txt(label)
+    candidates = [(sp["x"], sp["y"]) for sp in right_block if sp["ntext"] == target or target in sp["ntext"]]
+    if not candidates:
         return None
-    return (best[1], best[2])
+    # La etiqueta suele estar abajo; tomamos la más baja (mayor y)
+    return sorted(candidates, key=lambda t: t[1], reverse=True)[0]
 
 
 def extract_delegacion(doc: fitz.Document) -> str:
@@ -165,9 +130,59 @@ def extract_delegacion(doc: fitz.Document) -> str:
 
 
 # -------------------------
-# Percepción ciudadana (solo)
+# Matching robusto de barras
 # -------------------------
-def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float]]:
+def match_bars_by_nearest_x(
+    right_block: List[Dict],
+    labels: List[Tuple[str, Tuple[float, float]]],  # (col_name, (lx, ly))
+    window_up: float = 280.0,
+    max_dx: float = 200.0
+) -> Dict[str, Optional[float]]:
+    """
+    Toma todos los % de la zona derecha y los asigna a la etiqueta más cercana en X.
+    Esto evita que Menos/Más se inviertan.
+    """
+    pct_points = list_pct_points(right_block)
+    if not pct_points:
+        return {col: None for col, _ in labels}
+
+    # Solo % que estén arriba de la franja de etiquetas (aprox)
+    max_label_y = max(ly for _, (lx, ly) in labels)
+    candidates = []
+    for val, px, py in pct_points:
+        if py < max_label_y and py >= max_label_y - window_up:
+            candidates.append((val, px, py))
+
+    # Para cada etiqueta guardamos el mejor candidato (menor dx, luego menor dy)
+    best_for = {col: None for col, _ in labels}  # (score, val)
+    for val, px, py in candidates:
+        # etiqueta más cercana por X
+        nearest = None
+        for col, (lx, ly) in labels:
+            dx = abs(px - lx)
+            if dx <= max_dx:
+                dy = abs(ly - py)
+                score = dx * 1.0 + dy * 0.15
+                if nearest is None or score < nearest[0]:
+                    nearest = (score, col)
+        if nearest is None:
+            continue
+
+        score, col = nearest
+        cur = best_for[col]
+        if cur is None or score < cur[0]:
+            best_for[col] = (score, val)
+
+    out = {}
+    for col in best_for:
+        out[col] = best_for[col][1] if best_for[col] is not None else None
+    return out
+
+
+# -------------------------
+# Extracción Percepción ciudadana
+# -------------------------
+def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[str]]:
     out = {
         "Delegación": None,
         "Seguro en la comunidad (%)": None,
@@ -189,13 +204,12 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float
 
         out["Delegación"] = extract_delegacion(doc)
 
-        # separar izquierda (pie) y derecha (barras)
         w = page.rect.width
         midx = w * 0.52
         left = [sp for sp in block if sp["x"] < midx]
         right = [sp for sp in block if sp["x"] >= midx]
 
-        # ---- PIE (izquierda): 2 valores
+        # PIE (izquierda)
         left_vals = [v for (v, _, _) in list_pct_points(left)]
         two = unique_top([v for v in left_vals if 0 <= v <= 100], 2)
         if len(two) == 2:
@@ -204,42 +218,24 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float
             out["Seguro en la comunidad (%)"] = f"{seguro:.2f}%"
             out["Inseguro en la comunidad (%)"] = f"{inseguro:.2f}%"
 
-        # ---- BARRAS (derecha): asignación 1 a 1 por X (sin repetir)
-        pct_points = list_pct_points(right)
-
-        # tomamos una sola ubicación por etiqueta: la más “abajo” (la etiqueta suele estar bajo la barra)
-        def bottommost(pts: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
-            if not pts:
-                return None
-            return sorted(pts, key=lambda t: t[1], reverse=True)[0]
-
-        p_igual = bottommost(find_label_centers(right, ["Igual"]))
-        p_menos = bottommost(find_label_centers(right, ["Menos seguro"]))
-        p_mas = bottommost(find_label_centers(right, ["Más seguro", "Mas seguro", "Más Seguro"]))
+        # BARRAS (derecha) con asignación por X-nearest
+        p_igual = find_label_center(right, "Igual")
+        p_menos = find_label_center(right, "Menos seguro")
+        p_mas = find_label_center(right, "Más seguro") or find_label_center(right, "Mas seguro")
 
         labels = []
-        if p_igual: labels.append(("Comparación 2023 - Igual (%)", p_igual))
-        if p_menos: labels.append(("Comparación 2023 - Menos seguro (%)", p_menos))
-        if p_mas: labels.append(("Comparación 2023 - Más seguro (%)", p_mas))
+        if p_igual:
+            labels.append(("Comparación 2023 - Igual (%)", p_igual))
+        if p_menos:
+            labels.append(("Comparación 2023 - Menos seguro (%)", p_menos))
+        if p_mas:
+            labels.append(("Comparación 2023 - Más seguro (%)", p_mas))
 
-        # ordenar etiquetas de izquierda a derecha (por x), así el emparejamiento es estable
-        labels.sort(key=lambda item: item[1][0])
-
-        used = set()
-        for col, (lx, ly) in labels:
-            picked = pick_bar_value_for_label(
-                right_block=right,
-                label_x=lx,
-                label_y=ly,
-                pct_points=pct_points,
-                used_indices=used,
-                window_up=260.0,
-                max_dx=180.0,
-            )
-            if picked:
-                idx_used, val = picked
-                used.add(idx_used)
-                out[col] = f"{val:.2f}%"
+        if len(labels) == 3:
+            matched = match_bars_by_nearest_x(right, labels, window_up=300.0, max_dx=220.0)
+            for col, val in matched.items():
+                if val is not None:
+                    out[col] = f"{val:.2f}%"
 
         return out
 
@@ -250,28 +246,18 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float
 # UI
 # -------------------------
 st.set_page_config(page_title="Percepción ciudadana — MPGP", layout="wide")
-st.title("Percepción ciudadana — Extracción (paso 1)")
+st.title("Percepción ciudadana — Extracción (Paso 1)")
 
 files = st.file_uploader("Suba informes PDF", type="pdf", accept_multiple_files=True)
 
 if files:
     rows = []
-    prog = st.progress(0)
-    status = st.empty()
-
-    for i, f in enumerate(files, start=1):
-        status.write(f"Procesando: **{f.name}** ({i}/{len(files)})")
+    for f in files:
         doc = fitz.open(stream=f.read(), filetype="pdf")
         row = extract_percepcion_ciudadana(doc)
         doc.close()
-
         row["Archivo"] = f.name
         rows.append(row)
-
-        prog.progress(int(i / len(files) * 100))
-
-    prog.empty()
-    status.empty()
 
     df = pd.DataFrame(rows, columns=[
         "Archivo",
