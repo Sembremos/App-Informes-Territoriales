@@ -1,6 +1,7 @@
 import re
 import unicodedata
 from typing import Dict, List, Optional, Tuple
+from collections import Counter
 
 import fitz  # PyMuPDF
 import pandas as pd
@@ -76,7 +77,7 @@ def unique_top(vals: List[float], k: int, tol: float = 0.2) -> List[float]:
 
 
 # =========================
-# Spans / lines (para Hatillo)
+# Spans / lines (modo Hatillo)
 # =========================
 def get_spans(page: fitz.Page) -> List[Dict]:
     d = page.get_text("dict")
@@ -145,7 +146,7 @@ def slice_until_fuente(spans: List[Dict], y_start: float) -> List[Dict]:
 
 
 # =========================
-# Modo 1: Hatillo (etiquetas debajo de barras)
+# Modo 1: etiquetas debajo (Hatillo)
 # =========================
 def extract_comp_by_labels(page: fitz.Page, spans: List[Dict], lines: List[Dict], midx: float, y_start: float, block_right: List[Dict]) -> Dict[str, Optional[float]]:
     y_max = max(sp["cy"] for sp in block_right) if block_right else y_start + 9999
@@ -233,7 +234,7 @@ def extract_comp_by_labels(page: fitz.Page, spans: List[Dict], lines: List[Dict]
 
 
 # =========================
-# Modo 2: Leyenda por color (CORREGIDO)
+# Modo 2: por colores dominantes de BARRAS (SIN leyenda)
 # =========================
 def rgb_tuple(c):
     if c is None:
@@ -247,10 +248,19 @@ def color_dist(a, b) -> float:
     return ((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) ** 0.5
 
 
-def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Optional[float]]:
-    words = page.get_text("words")  # x0,y0,x1,y1,word,block,line,wordno
+def color_grey_score(c) -> float:
+    # qué tan "gris" es: cuanto más parecidos r,g,b, menor score
+    r, g, b = c
+    return abs(r-g) + abs(g-b) + abs(r-b)
 
-    # helper words centers
+
+def luminance(c) -> float:
+    r, g, b = c
+    return 0.2126*r + 0.7152*g + 0.0722*b
+
+
+def extract_comp_by_bar_colors(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Optional[float]]:
+    words = page.get_text("words")
     words2 = []
     for (x0, y0, x1, y1, w, *_rest) in words:
         cx = (x0 + x1) / 2.0
@@ -258,15 +268,14 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
         words2.append((x0, y0, x1, y1, cx, cy, w))
 
     drawings = page.get_drawings()
-    filled_rects = []
+
+    bar_rects = []
     for d in drawings:
         fill = rgb_tuple(d.get("fill"))
         if fill is None:
             continue
         for it in d.get("items", []):
-            if not it:
-                continue
-            if it[0] != "re":
+            if not it or it[0] != "re":
                 continue
             rect = it[1]
             if rect.x1 < midx:
@@ -275,83 +284,25 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
                 continue
             w = rect.x1 - rect.x0
             h = rect.y1 - rect.y0
-            filled_rects.append((rect, fill, w, h))
 
-    if not filled_rects:
+            # filtro de barras: alto y relativamente angosto
+            if h > 90 and w > 18 and w < 220 and rect.y0 > (y_start + 40):
+                bar_rects.append((rect, fill))
+
+    if len(bar_rects) < 2:
         return {
             "Comparación 2023 - Igual (%)": None,
             "Comparación 2023 - Menos seguro (%)": None,
             "Comparación 2023 - Más seguro (%)": None,
         }
 
-    legend_rects = []
-    bar_rects = []
-    for rect, fill, w, h in filled_rects:
-        # leyenda: cuadrito pequeño y abajo
-        if w < 45 and h < 45 and rect.y0 > (y_end - 320):
-            legend_rects.append((rect, fill))
-        # barras: rect alto
-        elif h > 80 and w > 15 and rect.y0 > (y_start + 40):
-            bar_rects.append((rect, fill))
-
-    if not legend_rects or not bar_rects:
-        return {
-            "Comparación 2023 - Igual (%)": None,
-            "Comparación 2023 - Menos seguro (%)": None,
-            "Comparación 2023 - Más seguro (%)": None,
-        }
-
-    # --- CORRECCIÓN CLAVE ---
-    # En vez de una caja grande, tomamos SOLO palabras cuya cy esté cerca del cy del cuadrito
-    def legend_label_for_rect(rect) -> str:
-        cy0 = (rect.y0 + rect.y1) / 2.0
-        x_min = rect.x1 + 4
-        x_max = rect.x1 + 260
-        band = 12  # estricto para no comerse otras líneas
-
-        line_words = []
-        for (x0, y0, x1, y1, cx, cy, w) in words2:
-            if x0 < x_min or x1 > x_max:
-                continue
-            if abs(cy - cy0) > band:
-                continue
-            line_words.append((x0, w))
-
-        line_words.sort(key=lambda t: t[0])
-        return norm(" ".join(w for _, w in line_words))
-
-    # mapa color_leyenda -> categoria
-    color_to_cat = {}
-    for rect, fill in legend_rects:
-        label = legend_label_for_rect(rect)
-        cat = None
-        if "igual" in label:
-            cat = "igual"
-        elif "mas seguro" in label:
-            cat = "mas"
-        elif "menos seguro" in label:
-            cat = "menos"
-
-        if cat:
-            # guardamos el color asociado a esa categoría
-            color_to_cat[fill] = cat
-
-    if not color_to_cat:
-        return {
-            "Comparación 2023 - Igual (%)": None,
-            "Comparación 2023 - Menos seguro (%)": None,
-            "Comparación 2023 - Más seguro (%)": None,
-        }
-
-    # % en el bloque derecho
+    # porcentajes en el lado derecho
     pct_points = []
-    for (x0, y0, x1, y1, cx, cy, w) in words2:
-        v = parse_pct(w)
+    for (x0, y0, x1, y1, cx, cy, wtxt) in words2:
+        v = parse_pct(wtxt)
         if v is None:
             continue
-        if cx < midx:
-            continue
-        if cy < y_start or cy > y_end:
+        if cx < midx or cy < y_start or cy > y_end:
             continue
         pct_points.append((v, cx, cy))
 
@@ -360,21 +311,60 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
         if all(abs(v - u[0]) > 0.2 for u in uniq_pcts):
             uniq_pcts.append((v, x, y))
 
-    # asignación color barra -> categoria (por distancia con el color de leyenda)
-    def nearest_cat(fill):
+    # 1) colores dominantes de barras (redondeo para agrupar)
+    rounded = []
+    for _rect, fill in bar_rects:
+        key = (round(fill[0], 2), round(fill[1], 2), round(fill[2], 2))
+        rounded.append(key)
+
+    common = [c for c, _n in Counter(rounded).most_common(3)]
+    # si por alguna razón hay menos de 3 colores, seguimos igual
+    if len(common) < 2:
+        common = [c for c, _n in Counter(rounded).most_common(2)]
+
+    # 2) clasificar colores → categorias
+    # gris = el más "gris"
+    common_sorted_by_grey = sorted(common, key=color_grey_score)
+    grey = common_sorted_by_grey[0]
+    others = [c for c in common if c != grey]
+
+    # entre los otros dos: más claro = Más seguro, más oscuro = Menos seguro
+    if len(others) >= 2:
+        others_sorted = sorted(others, key=luminance, reverse=True)
+        light = others_sorted[0]
+        dark = others_sorted[1]
+    elif len(others) == 1:
+        # caso raro: solo 2 colores detectados
+        light = others[0]
+        dark = others[0]
+    else:
+        light = grey
+        dark = grey
+
+    color_to_cat = {
+        grey: "igual",
+        light: "mas",
+        dark: "menos",
+    }
+
+    def nearest_color(c):
         best = None
-        for c_leg, cat in color_to_cat.items():
-            d = color_dist(fill, c_leg)
+        for cc in common:
+            d = color_dist(c, cc)
             if best is None or d < best[0]:
-                best = (d, cat)
+                best = (d, cc)
         return best[1] if best and best[0] < 0.35 else None
 
     results = {"igual": None, "menos": None, "mas": None}
 
-    # para cada barra: buscar % arriba cercano al centro X de la barra
+    # asignar por barra: % arriba más cercano al centro X
     for rect, fill in bar_rects:
-        cat = nearest_cat(fill)
-        if not cat:
+        fill_r = (round(fill[0], 2), round(fill[1], 2), round(fill[2], 2))
+        nn = nearest_color(fill_r)
+        if nn is None:
+            continue
+        cat = color_to_cat.get(nn)
+        if cat is None:
             continue
 
         bx = (rect.x0 + rect.x1) / 2.0
@@ -382,10 +372,10 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
         for (v, x, y) in uniq_pcts:
             if y >= rect.y0:
                 continue
-            if y < rect.y0 - 280:
+            if y < rect.y0 - 320:
                 continue
             dx = abs(x - bx)
-            if dx > 170:
+            if dx > 190:
                 continue
             score = dx + (rect.y0 - y) * 0.05
             if best is None or score < best[0]:
@@ -394,7 +384,7 @@ def extract_comp_by_legend_color(page: fitz.Page, midx: float, y_start: float, y
         if best and results[cat] is None:
             results[cat] = best[1]
 
-    # fallback top3
+    # fallback con top3
     top3 = unique_top([v for v, _, _ in uniq_pcts], 3)
     got = [v for v in results.values() if v is not None]
     if len(top3) == 3 and len(got) == 2:
@@ -424,7 +414,7 @@ def comp_values_ok(comp: Dict[str, Optional[float]]) -> bool:
 
 
 # =========================
-# Extracción principal
+# Extracción principal (solo lo que pediste)
 # =========================
 def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
     out = {
@@ -459,7 +449,7 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
     left = [sp for sp in block if sp["cx"] < midx]
     right = [sp for sp in block if sp["cx"] >= midx]
 
-    # PIE
+    # PIE (2 % principales)
     left_pcts = []
     for sp in left:
         v = parse_pct(sp["text"])
@@ -473,14 +463,14 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict:
 
     y_end = max(sp["cy"] for sp in block) if block else page.rect.height
 
-    # Modo 1
+    # modo 1 (Hatillo)
     comp1 = extract_comp_by_labels(page, spans, lines, midx, y_start, right)
     if comp_values_ok(comp1):
         out.update(comp1)
         return out
 
-    # Modo 2 (corregido)
-    comp2 = extract_comp_by_legend_color(page, midx, y_start, y_end)
+    # modo 2 (colores dominantes de barras)
+    comp2 = extract_comp_by_bar_colors(page, midx, y_start, y_end)
     if comp_values_ok(comp2):
         out.update(comp2)
         return out
