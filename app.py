@@ -126,108 +126,99 @@ def extract_delegacion(doc: fitz.Document) -> str:
 
 
 # -------------------------
-# Labels + matching robusto
+# Barras: match por etiqueta usando SOLO X
 # -------------------------
-def find_label_center(right_block: List[Dict], variants: List[str]) -> Optional[Tuple[float, float]]:
-    vv = [norm_txt(v) for v in variants]
-    candidates = []
-    for sp in right_block:
-        if any(v == sp["ntext"] or v in sp["ntext"] for v in vv):
-            candidates.append((sp["x"], sp["y"]))
-    if not candidates:
-        return None
-    # etiqueta suele estar abajo: tomar la más baja (mayor y)
-    return sorted(candidates, key=lambda t: t[1], reverse=True)[0]
-
-
-def bar_candidates_for_label(
-    pct_points: List[Tuple[float, float, float]],
-    lx: float,
-    ly: float,
-    window_up: float = 320.0,
-    max_dx: float = 220.0,
-) -> List[Tuple[float, int]]:
+def find_label_center_exact(right_block: List[Dict], patterns: List[str]) -> Optional[Tuple[float, float]]:
     """
-    Devuelve lista de (costo, idx_pct) para candidatos arriba de la etiqueta.
-    Costo mezcla dx y dy para preferir el % "encima" de la barra.
+    Encuentra la etiqueta por patrón EXACTO (normalizado) y toma la más baja (mayor y).
+    patterns ya vienen normalizados (sin tildes).
     """
     cands = []
-    for idx, (val, px, py) in enumerate(pct_points):
-        if not (ly - window_up <= py < ly):
-            continue
-        dx = abs(px - lx)
-        if dx > max_dx:
-            continue
-        dy = abs(ly - py)
-        cost = dx * 1.0 + dy * 0.15
-        cands.append((cost, idx))
-    # mejores primero
-    cands.sort(key=lambda t: t[0])
-    return cands
+    for sp in right_block:
+        t = sp["ntext"]
+        for p in patterns:
+            # match exacto de frase completa
+            if t == p or (p in t and len(t) <= len(p) + 2):
+                cands.append((sp["x"], sp["y"]))
+                break
+    if not cands:
+        return None
+    return sorted(cands, key=lambda z: z[1], reverse=True)[0]
 
 
-def solve_best_assignment(
-    pct_points: List[Tuple[float, float, float]],
+def solve_assignment_min_dx(
     labels: List[Tuple[str, Tuple[float, float]]],
+    pct_points: List[Tuple[float, float, float]],
+    base_y: float,
+    window_up: float = 320.0,
+    max_dx: float = 260.0
 ) -> Dict[str, Optional[float]]:
     """
-    Asignación 1-a-1: cada etiqueta obtiene un porcentaje distinto.
-    Como solo hay 3 etiquetas, probamos combinaciones de los top candidatos.
+    Candidatos = % arriba de base_y (zona barras).
+    Asignación 1-a-1 minimizando |px-lx| (solo X) para evitar el swap.
     """
-    # candidatos por etiqueta (top 6 para limitar búsqueda)
-    cand_lists = []
-    for col, (lx, ly) in labels:
-        c = bar_candidates_for_label(pct_points, lx, ly)
-        cand_lists.append((col, c[:6]))
+    # filtrar candidatos por ventana vertical
+    cand = [(v, x, y) for (v, x, y) in pct_points if (base_y - 15) > y >= (base_y - window_up)]
+    if not cand:
+        return {col: None for col, _ in labels}
 
-    best_total = None
-    best_map: Dict[str, Optional[int]] = {col: None for col, _ in labels}
+    # quitar duplicados por valor (si el PDF repite el mismo % en varios spans)
+    uniq = []
+    for v, x, y in sorted(cand, key=lambda t: (t[0], t[2])):
+        if all(abs(v - u[0]) > 0.2 for u in uniq):
+            uniq.append((v, x, y))
 
-    # backtracking pequeño (3 etiquetas)
-    used = set()
+    # quedarnos con los 6 más grandes por valor para reducir ruido
+    if len(uniq) > 6:
+        uniq = sorted(uniq, key=lambda t: t[0], reverse=True)[:6]
 
-    def dfs(i: int, total_cost: float, cur_map: Dict[str, Optional[int]]):
-        nonlocal best_total, best_map
-        if i == len(cand_lists):
-            if best_total is None or total_cost < best_total:
-                best_total = total_cost
-                best_map = cur_map.copy()
-            return
+    # probamos todas las asignaciones posibles (3! máximo)
+    best = None  # (cost, mapping)
+    from itertools import permutations
 
-        col, cands = cand_lists[i]
+    cols = [c for c, _ in labels]
+    lxs = {c: lx for c, (lx, ly) in labels}
 
-        # opción: no asignar (penaliza fuerte)
-        # pero preferimos asignar si hay candidatos
-        penalty = 9999.0
-        if best_total is None or total_cost + penalty < best_total:
-            cur_map[col] = None
-            dfs(i + 1, total_cost + penalty, cur_map)
-            cur_map.pop(col, None)
+    for perm in permutations(range(len(uniq)), r=len(labels)):
+        used = set()
+        cost = 0.0
+        ok = True
+        mapping = {}
+        for col, idx in zip(cols, perm):
+            if idx in used:
+                ok = False
+                break
+            used.add(idx)
+            v, px, py = uniq[idx]
+            dx = abs(px - lxs[col])
+            if dx > max_dx:
+                ok = False
+                break
+            cost += dx
+            mapping[col] = v
 
-        for cost, idx_pct in cands:
-            if idx_pct in used:
-                continue
-            if best_total is not None and total_cost + cost >= best_total:
-                continue
-            used.add(idx_pct)
-            cur_map[col] = idx_pct
-            dfs(i + 1, total_cost + cost, cur_map)
-            cur_map.pop(col, None)
-            used.remove(idx_pct)
+        if ok and (best is None or cost < best[0]):
+            best = (cost, mapping)
 
-    dfs(0, 0.0, {})
+    if best is None:
+        # fallback: por cada etiqueta, el más cercano en X aunque repita
+        out = {}
+        for col, (lx, ly) in labels:
+            best_dx = None
+            best_v = None
+            for v, px, py in uniq:
+                dx = abs(px - lx)
+                if dx <= max_dx and (best_dx is None or dx < best_dx):
+                    best_dx = dx
+                    best_v = v
+            out[col] = best_v
+        return out
 
-    # construir salida: col -> valor
-    out: Dict[str, Optional[float]] = {}
-    for col, _ in labels:
-        idx_pct = best_map.get(col)
-        out[col] = pct_points[idx_pct][0] if isinstance(idx_pct, int) else None
-
-    return out
+    return {c: best[1].get(c) for c in cols}
 
 
 # -------------------------
-# Percepción ciudadana (solo)
+# Extracción Percepción ciudadana
 # -------------------------
 def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[str]]:
     out = {
@@ -252,27 +243,24 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[str]]
 
         out["Delegación"] = extract_delegacion(doc)
 
-        # separar izquierda (pie) y derecha (barras)
         w = page.rect.width
         midx = w * 0.52
         left = [sp for sp in block if sp["x"] < midx]
         right = [sp for sp in block if sp["x"] >= midx]
 
-        # PIE (izquierda): 2 valores
+        # PIE (izquierda)
         left_vals = [v for (v, _, _) in list_pct_points(left)]
         two = unique_top([v for v in left_vals if 0 <= v <= 100], 2)
         if len(two) == 2:
-            seguro = min(two)
-            inseguro = max(two)
-            out["Seguro en la comunidad (%)"] = f"{seguro:.2f}%"
-            out["Inseguro en la comunidad (%)"] = f"{inseguro:.2f}%"
+            out["Seguro en la comunidad (%)"] = f"{min(two):.2f}%"
+            out["Inseguro en la comunidad (%)"] = f"{max(two):.2f}%"
 
-        # BARRAS (derecha): por etiqueta (orden no importa)
-        p_igual = find_label_center(right, ["igual"])
-        p_menos = find_label_center(right, ["menos seguro", "menosseguro"])
-        p_mas = find_label_center(right, ["mas seguro", "más seguro", "masseguro", "másseguro"])
+        # BARRAS (derecha) por etiqueta, SIN depender del orden
+        # patrones normalizados (sin tildes)
+        p_igual = find_label_center_exact(right, ["igual"])
+        p_menos = find_label_center_exact(right, ["menos seguro", "menosseguro"])
+        p_mas = find_label_center_exact(right, ["mas seguro", "masseguro"])
 
-        # si falta una etiqueta, igual intentamos con las que existan
         labels = []
         if p_igual:
             labels.append(("Comparación 2023 - Igual (%)", p_igual))
@@ -281,22 +269,22 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[str]]
         if p_mas:
             labels.append(("Comparación 2023 - Más seguro (%)", p_mas))
 
-        pct_points = list_pct_points(right)
+        if len(labels) >= 2:
+            # base_y: usamos el y más bajo de etiquetas
+            base_y = max(ly for _, (lx, ly) in labels)
+            pct_points = list_pct_points(right)
+            matched = solve_assignment_min_dx(labels, pct_points, base_y)
 
-        if len(labels) >= 2 and pct_points:
-            matched = solve_best_assignment(pct_points, labels)
-
-            # Si queda una etiqueta sin valor, usamos fallback con el % restante (más bajo de los 3 principales)
-            got = [v for v in matched.values() if v is not None]
-            if len(got) == len(labels) - 1:
+            # si faltara 1 valor y tenemos 3 etiquetas, completar con el restante de los 3 principales
+            if len(labels) == 3 and sum(v is not None for v in matched.values()) == 2:
                 all_vals = [v for (v, _, _) in pct_points]
-                uniq3 = unique_top(all_vals, 3)  # los 3 del gráfico normalmente
-                remaining = [v for v in uniq3 if all(abs(v - g) > 0.2 for g in got)]
+                top3 = unique_top(all_vals, 3)
+                got = [v for v in matched.values() if v is not None]
+                remaining = [v for v in top3 if all(abs(v - g) > 0.2 for g in got)]
                 if remaining:
-                    miss = remaining[0]  # normalmente queda 15.58
                     for k in matched:
                         if matched[k] is None:
-                            matched[k] = miss
+                            matched[k] = remaining[0]
 
             for col, val in matched.items():
                 if val is not None:
