@@ -1,17 +1,18 @@
+import io
 import re
 import unicodedata
-from typing import Dict, Optional, Tuple, List
 import colorsys
+from typing import Dict, Optional, Tuple, List
 
 import streamlit as st
 import pandas as pd
 
-
-# =========================
-# Helpers
-# =========================
+# --- regex % ---
 PCT_RE = re.compile(r"(\d{1,3}[.,]\d{1,2})\s*%")
 
+# =========================
+# Utils generales
+# =========================
 def norm(s: str) -> str:
     if not s:
         return ""
@@ -41,9 +42,14 @@ def fmt_pct(x) -> Optional[str]:
         return f"{x:.2f}%"
     return None
 
-def classify_bar_color(rgb: Tuple[float, float, float]) -> str:
-    """MPGP: gris=igual, celeste=mas, azul=menos."""
-    r, g, b = rgb
+def classify_bar_color(rgb01: Tuple[float, float, float]) -> str:
+    """
+    MPGP:
+    - gris -> igual
+    - celeste -> mas seguro
+    - azul oscuro -> menos seguro
+    """
+    r, g, b = rgb01
 
     # gris: canales parecidos
     if abs(r - g) < 0.08 and abs(g - b) < 0.08:
@@ -57,14 +63,34 @@ def classify_bar_color(rgb: Tuple[float, float, float]) -> str:
 
 
 # =========================
-# PDF (lazy import)
+# Chequeo OCR (para imágenes)
+# =========================
+def ocr_available() -> Tuple[bool, str]:
+    try:
+        import pytesseract  # noqa
+    except Exception as e:
+        return False, f"pytesseract no disponible: {e}"
+
+    # En Cloud el binario es lo que suele faltar
+    try:
+        import shutil
+        if shutil.which("tesseract") is None:
+            return False, "No se encontró el binario 'tesseract' (falta packages.txt con tesseract-ocr)."
+    except Exception:
+        pass
+
+    return True, "OK"
+
+
+# =========================
+# PDF EXTRACT (sin OCR)
 # =========================
 def extract_from_pdf(file_bytes: bytes) -> Dict[str, Optional[float]]:
     try:
         import fitz  # PyMuPDF
         import numpy as np
     except Exception as e:
-        raise RuntimeError(f"No se pudo importar PyMuPDF/numpy para PDF: {e}")
+        raise RuntimeError(f"Faltan dependencias PDF (PyMuPDF/numpy): {e}")
 
     def find_page(doc: "fitz.Document") -> Optional[int]:
         anchors = ["percepcion ciudadana", "se siente de seguro en su comunidad"]
@@ -129,6 +155,7 @@ def extract_from_pdf(file_bytes: bytes) -> Dict[str, Optional[float]]:
                 h = r.y1 - r.y0
                 if h > 90 and w > 12 and w < 340:
                     bars.append((h, cx, r))
+
         if not bars:
             return []
         bars.sort(key=lambda t: t[0], reverse=True)
@@ -155,6 +182,7 @@ def extract_from_pdf(file_bytes: bytes) -> Dict[str, Optional[float]]:
                 continue
             pts.append((v, cx, cy))
 
+        # dedupe
         uniq = []
         for v, x, y in sorted(pts, key=lambda t: (t[0], t[2])):
             if all(abs(v - u[0]) > 0.2 for u in uniq):
@@ -215,7 +243,7 @@ def extract_from_pdf(file_bytes: bytes) -> Dict[str, Optional[float]]:
             py = int(y_inside * zoom)
             px = max(0, min(img.shape[1] - 1, px))
             py = max(0, min(img.shape[0] - 1, py))
-            patch = img[max(0, py-5):py+6, max(0, px-5):px+6, :]
+            patch = img[max(0, py-6):py+7, max(0, px-6):px+7, :]
             mean = patch.mean(axis=(0, 1)) / 255.0
             cat = classify_bar_color((float(mean[0]), float(mean[1]), float(mean[2])))
             assigned[cat] = pct
@@ -229,51 +257,137 @@ def extract_from_pdf(file_bytes: bytes) -> Dict[str, Optional[float]]:
 
 
 # =========================
-# Imagen (OCR) - solo si hay tesseract
+# IMAGE EXTRACT (con OCR)
 # =========================
 def extract_from_image(file_bytes: bytes) -> Dict[str, Optional[float]]:
-    try:
-        from PIL import Image
-        import numpy as np
-    except Exception as e:
-        raise RuntimeError(f"No se pudo importar PIL/numpy para imagen: {e}")
+    ok, msg = ocr_available()
+    if not ok:
+        raise RuntimeError(msg)
 
-    try:
-        import pytesseract
-        tess_ok = True
-    except Exception:
-        tess_ok = False
+    import numpy as np
+    from PIL import Image
+    import pytesseract
 
-    if not tess_ok:
-        raise RuntimeError("OCR no disponible: falta pytesseract/tesseract-ocr (packages.txt).")
+    pil = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    img = np.array(pil)
+    H, W, _ = img.shape
 
-    img = np.array(Image.open(st.runtime.uploaded_file_manager.UploadedFile(io=None)).convert("RGB"))  # dummy to satisfy type check
+    # OCR data
+    data = pytesseract.image_to_data(pil, output_type=pytesseract.Output.DICT, config="--psm 6")
+
+    # extraer porcentajes con centroides
+    pts: List[Tuple[float, float, float]] = []
+    for i in range(len(data["text"])):
+        txt = (data["text"][i] or "").strip()
+        v = parse_pct(txt)
+        if v is None:
+            continue
+        x = data["left"][i]
+        y = data["top"][i]
+        w = data["width"][i]
+        h = data["height"][i]
+        pts.append((v, x + w/2.0, y + h/2.0))
+
+    # Ventana aproximada (layout MPGP)
+    y0 = H * 0.12
+    y1 = H * 0.94
+    midx = W * 0.52
+
+    out = {
+        "Delegación": "DESDE_IMAGEN",
+        "Seguro en la comunidad (%)": None,
+        "Inseguro en la comunidad (%)": None,
+        "Comparación 2023 - Igual (%)": None,
+        "Comparación 2023 - Más seguro (%)": None,
+        "Comparación 2023 - Menos seguro (%)": None,
+    }
+
+    # Pastel: 2 % a la izquierda
+    left_vals = [v for (v, x, y) in pts if x < midx and y0 <= y <= y1]
+    uniq = []
+    for v in sorted(left_vals, reverse=True):
+        if all(abs(v - u) > 0.2 for u in uniq):
+            uniq.append(v)
+        if len(uniq) == 2:
+            break
+    if len(uniq) == 2:
+        out["Inseguro en la comunidad (%)"] = max(uniq)
+        out["Seguro en la comunidad (%)"] = min(uniq)
+
+    # Comparación: 3 % a la derecha (encima de barras)
+    right = [(v, x, y) for (v, x, y) in pts if x >= midx and y0 <= y <= y1]
+    # dedupe por valor
+    dedup = []
+    for v, x, y in sorted(right, key=lambda t: (t[0], t[2])):
+        if all(abs(v - u[0]) > 0.2 for u in dedup):
+            dedup.append((v, x, y))
+
+    # nos quedamos con 3 más “arriba” (menor y)
+    dedup = sorted(dedup, key=lambda t: t[2])[:3]
+
+    def mean_rgb_patch(x: float, y: float, r: int = 7) -> Tuple[float, float, float]:
+        xi = int(max(0, min(W - 1, x)))
+        yi = int(max(0, min(H - 1, y)))
+        patch = img[max(0, yi-r):yi+r+1, max(0, xi-r):xi+r+1, :]
+        mean = patch.mean(axis=(0, 1)) / 255.0
+        return (float(mean[0]), float(mean[1]), float(mean[2]))
+
+    assigned = {"igual": None, "mas": None, "menos": None}
+    for v, x, y in dedup:
+        # muestrear color dentro de la barra (debajo del %)
+        y_in = y + H * 0.10
+        rgb = mean_rgb_patch(x, y_in, r=8)
+        cat = classify_bar_color(rgb)
+        assigned[cat] = v
+
+    out["Comparación 2023 - Igual (%)"] = assigned["igual"]
+    out["Comparación 2023 - Más seguro (%)"] = assigned["mas"]
+    out["Comparación 2023 - Menos seguro (%)"] = assigned["menos"]
+
+    return out
 
 
 # =========================
-# UI
+# Streamlit UI
 # =========================
 st.set_page_config(page_title="MPGP Extractor", layout="wide")
-st.title("Extractor MPGP — Percepción ciudadana")
+st.title("Extractor MPGP — Percepción ciudadana (PDF o Imágenes)")
 
-st.write("Subí PDFs. (La parte de imágenes la activamos cuando esté tesseract instalado en Cloud).")
+ok_ocr, msg_ocr = ocr_available()
+if ok_ocr:
+    st.success("OCR para imágenes: OK (tesseract disponible).")
+else:
+    st.warning(f"OCR para imágenes: NO disponible. Motivo: {msg_ocr}")
+
+st.caption("Extrae: Seguro/Inseguro y Comparación 2023 (Igual/Más/Menos).")
 
 files = st.file_uploader(
-    "Subí PDFs",
-    type=["pdf"],
+    "Subí archivos (PDF, PNG, JPG, JPEG). Podés subir muchos.",
+    type=["pdf", "png", "jpg", "jpeg"],
     accept_multiple_files=True
 )
 
-rows, errors = [], []
+rows = []
+errs = []
 
 if files:
     prog = st.progress(0)
     for i, f in enumerate(files, start=1):
+        name = f.name
+        ext = name.lower().split(".")[-1]
+
         try:
-            data = extract_from_pdf(f.read())
-            rows.append({"Archivo": f.name, **data})
+            b = f.read()
+            if ext == "pdf":
+                data = extract_from_pdf(b)
+            else:
+                data = extract_from_image(b)
+
+            rows.append({"Archivo": name, **data})
+
         except Exception as e:
-            errors.append((f.name, str(e)))
+            errs.append((name, str(e)))
+
         prog.progress(int(i / len(files) * 100))
     prog.empty()
 
@@ -285,6 +399,7 @@ if rows:
         "Comparación 2023 - Igual (%)", "Comparación 2023 - Más seguro (%)", "Comparación 2023 - Menos seguro (%)",
     ]
     df = df[[c for c in order if c in df.columns]]
+
     for c in order[2:]:
         if c in df.columns:
             df[c] = df[c].map(fmt_pct)
@@ -299,7 +414,10 @@ if rows:
         mime="text/csv",
     )
 
-if errors:
-    st.subheader("Errores")
-    for n, msg in errors:
-        st.error(f"{n}: {msg}")
+if errs:
+    st.subheader("Errores por archivo")
+    for n, m in errs:
+        st.error(f"{n}: {m}")
+
+if not files:
+    st.info("Subí PDFs o imágenes para procesar.")
