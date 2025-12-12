@@ -7,6 +7,40 @@ from openpyxl import load_workbook
 
 st.set_page_config(page_title="Índice Territorial — Lectura masiva de Excel", layout="wide")
 
+CSS = """
+<style>
+.card {
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 14px;
+  padding: 16px 16px;
+  background: rgba(255,255,255,0.04);
+  margin-bottom: 14px;
+}
+.small-muted {opacity:0.75; font-size:12px;}
+.section-title {font-weight:900; font-size:16px; margin: 10px 0 6px 0;}
+.kpi-wrap {display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;}
+.kpi {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.12);
+  min-width: 220px;
+  background: rgba(255,255,255,0.03);
+}
+.kpi .label {opacity:0.85; font-size:12px;}
+.kpi .value {font-weight:900; font-size:22px; margin-top:2px;}
+.badge {
+  display:inline-block;
+  padding:6px 10px;
+  border-radius:999px;
+  font-weight:900;
+  font-size:12px;
+  color:#111;
+}
+hr.sep {border:none; border-top:1px solid rgba(255,255,255,0.12); margin:12px 0;}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
 
 # ============================================================
 # Normalización / conversión
@@ -34,6 +68,9 @@ def to_pct(x: Any) -> Optional[float]:
         v *= 100.0
     return v
 
+def fmt_pct(x: float) -> str:
+    return f"{x:.2f}%"
+
 def classify_index(x: float) -> str:
     if x <= 20:
         return "Crítico (0-20)"
@@ -59,7 +96,7 @@ def level_color(level: str) -> str:
 
 
 # ============================================================
-# Lectura robusta: incluye merges (celdas combinadas)
+# Lectura robusta con merges
 # ============================================================
 def sheet_to_matrix(ws) -> List[List[Any]]:
     max_r = ws.max_row or 1
@@ -85,7 +122,7 @@ def sheet_to_matrix(ws) -> List[List[Any]]:
 
 
 # ============================================================
-# Detección de tablas por título + columna porcentaje
+# Detección de tablas
 # ============================================================
 def find_title_cells(mat: List[List[Any]], title_needles: List[str]) -> List[Tuple[int, int]]:
     needles = [norm(n) for n in title_needles]
@@ -179,7 +216,7 @@ BLOCKS = {
     },
 }
 
-# Pesos (según tu lógica)
+# Pesos
 PG_W = {"inseguro": 0.0, "seguro": 1.0}
 CA_W = {"menos_seguro": 0.0, "igual": 0.5, "mas_seguro": 1.0}
 SP_W = {"excelente": 1.0, "buena": 0.75, "regular": 0.50, "mala": 0.0, "muy_mala": 0.0}
@@ -190,14 +227,7 @@ def score(table_map: Dict[str, float], weights: Dict[str, float]) -> float:
 
 
 def extract_from_workbook(wb) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[str]]:
-    """
-    Devuelve:
-      - res: puntajes + índices
-      - raw: datos detectados (% por opción)
-      - errores
-    """
     found = {"PG": None, "CA": None, "SP": None, "UA": None}
-    sheet_found = {"PG": None, "CA": None, "SP": None, "UA": None}
 
     for sname in wb.sheetnames:
         ws = wb[sname]
@@ -215,61 +245,40 @@ def extract_from_workbook(wb) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[s
                 tbl = read_table_down(mat, tr, pct_col, max_rows=40)
                 if match_labels(tbl, cfg["expect"]):
                     found[key] = tbl
-                    sheet_found[key] = sname
                     break
 
         if all(found[k] is not None for k in found):
             break
 
     errors = []
-    for k, msg in [
-        ("PG", "No detecté la tabla de Percepción General (No/Sí)."),
-        ("CA", "No detecté la tabla de Comparación Año Anterior (Menos/Igual/Más)."),
-        ("SP", "No detecté la tabla de Percepción del Servicio Policial (Excelente…Muy Mala)."),
-        ("UA", "No detecté la tabla de Calificación del Último Año (Igual/Mejor/Peor)."),
-    ]:
-        if found[k] is None:
-            errors.append(msg)
-
+    if found["PG"] is None: errors.append("No detecté la tabla de Percepción General (No/Sí).")
+    if found["CA"] is None: errors.append("No detecté la tabla de Comparación Año Anterior (Menos/Igual/Más).")
+    if found["SP"] is None: errors.append("No detecté la tabla de Percepción del Servicio Policial (Excelente…Muy Mala).")
+    if found["UA"] is None: errors.append("No detecté la tabla de Calificación del Último Año (Igual/Mejor/Peor).")
     if errors:
         return None, None, errors
 
-    # -----------------------
-    # RAW % (lo que lee)
-    # -----------------------
     raw = {
-        "hoja_pg": sheet_found["PG"],
-        "hoja_ca": sheet_found["CA"],
-        "hoja_sp": sheet_found["SP"],
-        "hoja_ua": sheet_found["UA"],
-
-        # Percepción general
         "pg_no": get_value_contains(found["PG"], "no"),
         "pg_si": get_value_contains(found["PG"], "si") or get_value_contains(found["PG"], "sí"),
 
-        # Comparación año anterior
+        "ca_menos": get_value_contains(found["CA"], "menos seguro"),
         "ca_igual": get_value_contains(found["CA"], "igual"),
-        "ca_mas_seguro": get_value_contains(found["CA"], "mas seguro") or get_value_contains(found["CA"], "más seguro"),
-        "ca_menos_seguro": get_value_contains(found["CA"], "menos seguro"),
+        "ca_mas": get_value_contains(found["CA"], "mas seguro") or get_value_contains(found["CA"], "más seguro"),
 
-        # Servicio policial
         "sp_excelente": get_value_contains(found["SP"], "excelente"),
         "sp_buena": get_value_contains(found["SP"], "buena"),
         "sp_regular": get_value_contains(found["SP"], "regular"),
         "sp_mala": get_value_contains(found["SP"], "mala"),
         "sp_muy_mala": get_value_contains(found["SP"], "muy mala"),
 
-        # Último año
         "ua_igual": get_value_contains(found["UA"], "igual"),
         "ua_mejor": get_value_contains(found["UA"], "mejor"),
         "ua_peor": get_value_contains(found["UA"], "peor"),
     }
 
-    # -----------------------
-    # Mapeo para puntajes
-    # -----------------------
     pg_map = {"inseguro": raw["pg_no"], "seguro": raw["pg_si"]}
-    ca_map = {"igual": raw["ca_igual"], "mas_seguro": raw["ca_mas_seguro"], "menos_seguro": raw["ca_menos_seguro"]}
+    ca_map = {"menos_seguro": raw["ca_menos"], "igual": raw["ca_igual"], "mas_seguro": raw["ca_mas"]}
     sp_map = {
         "excelente": raw["sp_excelente"], "buena": raw["sp_buena"], "regular": raw["sp_regular"],
         "mala": raw["sp_mala"], "muy_mala": raw["sp_muy_mala"]
@@ -300,10 +309,19 @@ def extract_from_workbook(wb) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[s
 
 
 # ============================================================
+# UI helpers
+# ============================================================
+def df_block(rows: List[Tuple[str, float]]) -> pd.DataFrame:
+    d = pd.DataFrame(rows, columns=["Respuesta", "Porcentaje"])
+    d["Porcentaje"] = d["Porcentaje"].map(lambda x: f"{x:.2f}%")
+    return d
+
+
+# ============================================================
 # UI
 # ============================================================
 st.title("Índice Territorial — Lectura masiva de Excel")
-st.caption("Ahora también muestra los porcentajes detectados (datos leídos), además de los puntajes.")
+st.caption("Vista mejor acomodada: tablas con porcentajes + puntajes por bloque + KPIs.")
 
 files = st.file_uploader(
     "Sube hasta 80 archivos Excel (.xlsx / .xlsm)",
@@ -325,37 +343,36 @@ for f in files:
             fails.append({"archivo": f.name, "errores": errs})
             continue
 
-        # fila consolidada con TODO
         results_rows.append({
             "archivo": f.name,
 
             # datos detectados
-            "pg_no_%": round(raw["pg_no"], 3),
-            "pg_si_%": round(raw["pg_si"], 3),
+            "pg_no_%": raw["pg_no"],
+            "pg_si_%": raw["pg_si"],
 
-            "ca_igual_%": round(raw["ca_igual"], 3),
-            "ca_mas_seguro_%": round(raw["ca_mas_seguro"], 3),
-            "ca_menos_seguro_%": round(raw["ca_menos_seguro"], 3),
+            "ca_menos_seguro_%": raw["ca_menos"],
+            "ca_igual_%": raw["ca_igual"],
+            "ca_mas_seguro_%": raw["ca_mas"],
 
-            "sp_excelente_%": round(raw["sp_excelente"], 3),
-            "sp_buena_%": round(raw["sp_buena"], 3),
-            "sp_regular_%": round(raw["sp_regular"], 3),
-            "sp_mala_%": round(raw["sp_mala"], 3),
-            "sp_muy_mala_%": round(raw["sp_muy_mala"], 3),
+            "sp_excelente_%": raw["sp_excelente"],
+            "sp_buena_%": raw["sp_buena"],
+            "sp_regular_%": raw["sp_regular"],
+            "sp_mala_%": raw["sp_mala"],
+            "sp_muy_mala_%": raw["sp_muy_mala"],
 
-            "ua_igual_%": round(raw["ua_igual"], 3),
-            "ua_mejor_%": round(raw["ua_mejor"], 3),
-            "ua_peor_%": round(raw["ua_peor"], 3),
+            "ua_igual_%": raw["ua_igual"],
+            "ua_mejor_%": raw["ua_mejor"],
+            "ua_peor_%": raw["ua_peor"],
 
             # puntajes
-            "puntaje_percepcion_general": round(res["puntaje_percepcion_general"], 3),
-            "puntaje_comparacion_anio_anterior": round(res["puntaje_comparacion_anio_anterior"], 3),
-            "puntaje_servicio_policial": round(res["puntaje_servicio_policial"], 3),
-            "puntaje_ultimo_anio": round(res["puntaje_ultimo_anio"], 3),
+            "puntaje_percepcion_general": res["puntaje_percepcion_general"],
+            "puntaje_comparacion_anio_anterior": res["puntaje_comparacion_anio_anterior"],
+            "puntaje_servicio_policial": res["puntaje_servicio_policial"],
+            "puntaje_ultimo_anio": res["puntaje_ultimo_anio"],
 
-            "percepcion_del_entorno": round(res["percepcion_del_entorno"], 3),
-            "desempeno_policia": round(res["desempeno_policia"], 3),
-            "indice_global": round(res["indice_global"], 3),
+            "percepcion_del_entorno": res["percepcion_del_entorno"],
+            "desempeno_policia": res["desempeno_policia"],
+            "indice_global": res["indice_global"],
             "nivel_indice": res["nivel_indice"],
         })
 
@@ -363,69 +380,116 @@ for f in files:
         fails.append({"archivo": f.name, "errores": [f"Error general leyendo archivo: {e}"]})
 
 
-# Render
 if results_rows:
-    st.subheader("✅ Resultados (con datos detectados)")
+    st.subheader("✅ Resultados")
 
     for r in results_rows:
-        color = level_color(r["nivel_indice"])
-        st.markdown(
-            f"""
-            <div style="border:1px solid rgba(255,255,255,0.15); border-radius:14px; padding:14px; background:rgba(255,255,255,0.04); margin-bottom:12px;">
-              <div style="font-weight:800; font-size:16px;">📄 {r["archivo"]}</div>
+        level = r["nivel_indice"]
+        color = level_color(level)
 
-              <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
-                <div style="padding:10px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); min-width:220px;">
-                  <div style="opacity:0.85; font-size:12px;">Percepción del entorno</div>
-                  <div style="font-weight:800; font-size:22px;">{r["percepcion_del_entorno"]:.2f}</div>
-                </div>
-                <div style="padding:10px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); min-width:220px;">
-                  <div style="opacity:0.85; font-size:12px;">Desempeño policía</div>
-                  <div style="font-weight:800; font-size:22px;">{r["desempeno_policia"]:.2f}</div>
-                </div>
-                <div style="padding:10px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); min-width:220px;">
-                  <div style="opacity:0.85; font-size:12px;">Índice Global</div>
-                  <div style="font-weight:800; font-size:22px;">{r["indice_global"]:.2f}</div>
-                </div>
-              </div>
+        # KPIs
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f"<div style='font-weight:900; font-size:16px;'>📄 {r['archivo']}</div>", unsafe_allow_html=True)
 
-              <div style="margin-top:10px;">
-                <span style="display:inline-block; padding:6px 10px; border-radius:999px; font-weight:800; font-size:12px; background:{color}; color:#111;">
-                  {r["nivel_indice"]}
-                </span>
-              </div>
+        st.markdown('<div class="kpi-wrap">', unsafe_allow_html=True)
+        st.markdown(f"""
+            <div class="kpi"><div class="label">Percepción del entorno</div><div class="value">{r["percepcion_del_entorno"]:.2f}</div></div>
+            <div class="kpi"><div class="label">Desempeño policía</div><div class="value">{r["desempeno_policia"]:.2f}</div></div>
+            <div class="kpi"><div class="label">Índice Global</div><div class="value">{r["indice_global"]:.2f}</div></div>
+        """, unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-              <div style="margin-top:14px; font-weight:800;">Datos detectados (porcentajes):</div>
-              <ul style="margin-top:6px;">
-                <li><b>Percepción General:</b> No={r["pg_no_%"]:.2f}% | Sí={r["pg_si_%"]:.2f}%</li>
-                <li><b>Comparación Año Anterior:</b> Menos={r["ca_menos_seguro_%"]:.2f}% | Igual={r["ca_igual_%"]:.2f}% | Más={r["ca_mas_seguro_%"]:.2f}%</li>
-                <li><b>Servicio Policial:</b> Excelente={r["sp_excelente_%"]:.2f}% | Buena={r["sp_buena_%"]:.2f}% | Regular={r["sp_regular_%"]:.2f}% | Mala={r["sp_mala_%"]:.2f}% | Muy Mala={r["sp_muy_mala_%"]:.2f}%</li>
-                <li><b>Último Año:</b> Igual={r["ua_igual_%"]:.2f}% | Mejor={r["ua_mejor_%"]:.2f}% | Peor={r["ua_peor_%"]:.2f}%</li>
-              </ul>
+        st.markdown(f"<span class='badge' style='background:{color};'>{level}</span>", unsafe_allow_html=True)
+        st.markdown("<hr class='sep'>", unsafe_allow_html=True)
 
-              <div style="margin-top:10px; font-weight:800;">Puntajes por bloque (0-100):</div>
-              <ul style="margin-top:6px;">
-                <li>Percepción General (No/Sí): <b>{r["puntaje_percepcion_general"]:.2f}</b></li>
-                <li>Comparación Año Anterior (Menos/Igual/Más): <b>{r["puntaje_comparacion_anio_anterior"]:.2f}</b></li>
-                <li>Servicio Policial (Excelente…Muy Mala): <b>{r["puntaje_servicio_policial"]:.2f}</b></li>
-                <li>Último Año (Igual/Mejor/Peor): <b>{r["puntaje_ultimo_anio"]:.2f}</b></li>
-              </ul>
+        # Datos detectados en tablas (2 columnas)
+        colA, colB = st.columns(2)
 
-              <div style="opacity:0.75; font-size:12px;">
-                Fórmulas: Entorno = promedio(PG, Comparación). Policía = promedio(Servicio Policial, Último Año). Global = promedio(Entorno, Policía).
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True
+        with colA:
+            st.markdown("<div class='section-title'>Datos detectados — Percepción General</div>", unsafe_allow_html=True)
+            st.dataframe(
+                df_block([
+                    ("No", r["pg_no_%"]),
+                    ("Sí", r["pg_si_%"]),
+                ]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.markdown("<div class='section-title'>Datos detectados — Comparación Año Anterior</div>", unsafe_allow_html=True)
+            st.dataframe(
+                df_block([
+                    ("Menos seguro", r["ca_menos_seguro_%"]),
+                    ("Igual", r["ca_igual_%"]),
+                    ("Más seguro", r["ca_mas_seguro_%"]),
+                ]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        with colB:
+            st.markdown("<div class='section-title'>Datos detectados — Servicio Policial</div>", unsafe_allow_html=True)
+            st.dataframe(
+                df_block([
+                    ("Excelente", r["sp_excelente_%"]),
+                    ("Buena", r["sp_buena_%"]),
+                    ("Regular", r["sp_regular_%"]),
+                    ("Mala", r["sp_mala_%"]),
+                    ("Muy mala", r["sp_muy_mala_%"]),
+                ]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.markdown("<div class='section-title'>Datos detectados — Último Año (Servicio Policial)</div>", unsafe_allow_html=True)
+            st.dataframe(
+                df_block([
+                    ("Igual", r["ua_igual_%"]),
+                    ("Mejor servicio", r["ua_mejor_%"]),
+                    ("Peor servicio", r["ua_peor_%"]),
+                ]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        st.markdown("<hr class='sep'>", unsafe_allow_html=True)
+
+        # Puntajes (tabla)
+        st.markdown("<div class='section-title'>Puntajes por bloque (0–100)</div>", unsafe_allow_html=True)
+        df_scores = pd.DataFrame(
+            [
+                ("Percepción General (No/Sí)", r["puntaje_percepcion_general"]),
+                ("Comparación Año Anterior (Menos/Igual/Más)", r["puntaje_comparacion_anio_anterior"]),
+                ("Servicio Policial (Excelente…Muy mala)", r["puntaje_servicio_policial"]),
+                ("Último Año (Igual/Mejor/Peor)", r["puntaje_ultimo_anio"]),
+            ],
+            columns=["Bloque", "Puntaje (0-100)"]
         )
+        df_scores["Puntaje (0-100)"] = df_scores["Puntaje (0-100)"].map(lambda x: f"{x:.2f}")
+        st.dataframe(df_scores, use_container_width=True, hide_index=True)
 
-    st.subheader("📊 Consolidado (incluye datos detectados)")
-    df_out = pd.DataFrame(results_rows).sort_values("indice_global", ascending=True)
-    st.dataframe(df_out, use_container_width=True)
+        st.markdown("<div class='small-muted'>Fórmulas: Entorno = promedio(PG, Comparación). Policía = promedio(Servicio Policial, Último Año). Global = promedio(Entorno, Policía).</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Consolidado + descarga
+    st.subheader("📊 Consolidado")
+    df_out = pd.DataFrame(results_rows).copy()
+
+    # Formateo agradable para vista (sin afectar descarga)
+    df_show = df_out.copy()
+    pct_cols = [c for c in df_show.columns if c.endswith("_%")]
+    for c in pct_cols:
+        df_show[c] = df_show[c].map(lambda x: f"{float(x):.2f}%")
+    num_cols = ["puntaje_percepcion_general","puntaje_comparacion_anio_anterior","puntaje_servicio_policial","puntaje_ultimo_anio",
+                "percepcion_del_entorno","desempeno_policia","indice_global"]
+    for c in num_cols:
+        df_show[c] = df_show[c].map(lambda x: f"{float(x):.3f}")
+
+    st.dataframe(df_show.sort_values("indice_global", ascending=True), use_container_width=True)
 
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="consolidado")
+        df_out.to_excel(writer, index=False, sheet_name="consolidado")  # descarga numérica real
     st.download_button(
         "⬇️ Descargar consolidado (Excel)",
         data=bio.getvalue(),
