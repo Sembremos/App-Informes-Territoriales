@@ -68,9 +68,6 @@ def to_pct(x: Any) -> Optional[float]:
         v *= 100.0
     return v
 
-def fmt_pct(x: float) -> str:
-    return f"{x:.2f}%"
-
 def classify_index(x: float) -> str:
     if x <= 20:
         return "Crítico (0-20)"
@@ -321,7 +318,7 @@ def df_block(rows: List[Tuple[str, float]]) -> pd.DataFrame:
 # UI
 # ============================================================
 st.title("Índice Territorial — Lectura masiva de Excel")
-st.caption("Vista mejor acomodada: tablas con porcentajes + puntajes por bloque + KPIs.")
+st.caption("Sí: podés cargar múltiples Excel (hasta 80) y se calculan todos.")
 
 files = st.file_uploader(
     "Sube hasta 80 archivos Excel (.xlsx / .xlsm)",
@@ -346,7 +343,6 @@ for f in files:
         results_rows.append({
             "archivo": f.name,
 
-            # datos detectados
             "pg_no_%": raw["pg_no"],
             "pg_si_%": raw["pg_si"],
 
@@ -364,7 +360,6 @@ for f in files:
             "ua_mejor_%": raw["ua_mejor"],
             "ua_peor_%": raw["ua_peor"],
 
-            # puntajes
             "puntaje_percepcion_general": res["puntaje_percepcion_general"],
             "puntaje_comparacion_anio_anterior": res["puntaje_comparacion_anio_anterior"],
             "puntaje_servicio_policial": res["puntaje_servicio_policial"],
@@ -387,14 +382,13 @@ if results_rows:
         level = r["nivel_indice"]
         color = level_color(level)
 
-        # KPIs
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f"<div style='font-weight:900; font-size:16px;'>📄 {r['archivo']}</div>", unsafe_allow_html=True)
 
         st.markdown('<div class="kpi-wrap">', unsafe_allow_html=True)
         st.markdown(f"""
             <div class="kpi"><div class="label">Percepción del entorno</div><div class="value">{r["percepcion_del_entorno"]:.2f}</div></div>
-            <div class="kpi"><div class="label">Desempeño policía</div><div class="value">{r["desempeno_policia"]:.2f}</div></div>
+            <div class="kpi"><div class="label">Desempeño policial</div><div class="value">{r["desempeno_policia"]:.2f}</div></div>
             <div class="kpi"><div class="label">Índice Global</div><div class="value">{r["indice_global"]:.2f}</div></div>
         """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -402,21 +396,13 @@ if results_rows:
         st.markdown(f"<span class='badge' style='background:{color};'>{level}</span>", unsafe_allow_html=True)
         st.markdown("<hr class='sep'>", unsafe_allow_html=True)
 
-        # Datos detectados en tablas (2 columnas)
         colA, colB = st.columns(2)
 
         with colA:
-            st.markdown("<div class='section-title'>Datos detectados — Percepción General</div>", unsafe_allow_html=True)
-            st.dataframe(
-                df_block([
-                    ("No", r["pg_no_%"]),
-                    ("Sí", r["pg_si_%"]),
-                ]),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.markdown("<div class='section-title'>Percepción general — Datos detectados</div>", unsafe_allow_html=True)
+            st.dataframe(df_block([("No", r["pg_no_%"]), ("Sí", r["pg_si_%"])]), use_container_width=True, hide_index=True)
 
-            st.markdown("<div class='section-title'>Datos detectados — Comparación Año Anterior</div>", unsafe_allow_html=True)
+            st.markdown("<div class='section-title'>Comparación con el año anterior — Datos detectados</div>", unsafe_allow_html=True)
             st.dataframe(
                 df_block([
                     ("Menos seguro", r["ca_menos_seguro_%"]),
@@ -428,7 +414,7 @@ if results_rows:
             )
 
         with colB:
-            st.markdown("<div class='section-title'>Datos detectados — Servicio Policial</div>", unsafe_allow_html=True)
+            st.markdown("<div class='section-title'>Percepción del servicio policial — Datos detectados</div>", unsafe_allow_html=True)
             st.dataframe(
                 df_block([
                     ("Excelente", r["sp_excelente_%"]),
@@ -441,7 +427,7 @@ if results_rows:
                 hide_index=True
             )
 
-            st.markdown("<div class='section-title'>Datos detectados — Último Año (Servicio Policial)</div>", unsafe_allow_html=True)
+            st.markdown("<div class='section-title'>Servicio policial del último año — Datos detectados</div>", unsafe_allow_html=True)
             st.dataframe(
                 df_block([
                     ("Igual", r["ua_igual_%"]),
@@ -454,42 +440,88 @@ if results_rows:
 
         st.markdown("<hr class='sep'>", unsafe_allow_html=True)
 
-        # Puntajes (tabla)
         st.markdown("<div class='section-title'>Puntajes por bloque (0–100)</div>", unsafe_allow_html=True)
         df_scores = pd.DataFrame(
             [
-                ("Percepción General (No/Sí)", r["puntaje_percepcion_general"]),
-                ("Comparación Año Anterior (Menos/Igual/Más)", r["puntaje_comparacion_anio_anterior"]),
-                ("Servicio Policial (Excelente…Muy mala)", r["puntaje_servicio_policial"]),
-                ("Último Año (Igual/Mejor/Peor)", r["puntaje_ultimo_anio"]),
+                ("Percepción general (No/Sí)", r["puntaje_percepcion_general"]),
+                ("Comparación con el año anterior (Menos/Igual/Más)", r["puntaje_comparacion_anio_anterior"]),
+                ("Percepción del servicio policial (Excelente…Muy mala)", r["puntaje_servicio_policial"]),
+                ("Servicio policial del último año (Igual/Mejor/Peor)", r["puntaje_ultimo_anio"]),
             ],
             columns=["Bloque", "Puntaje (0-100)"]
         )
         df_scores["Puntaje (0-100)"] = df_scores["Puntaje (0-100)"].map(lambda x: f"{x:.2f}")
         st.dataframe(df_scores, use_container_width=True, hide_index=True)
 
-        st.markdown("<div class='small-muted'>Fórmulas: Entorno = promedio(PG, Comparación). Policía = promedio(Servicio Policial, Último Año). Global = promedio(Entorno, Policía).</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='small-muted'>Fórmulas: Entorno = promedio(Percepción general, Comparación). "
+            "Policía = promedio(Servicio policial, Último año). Global = promedio(Entorno, Policía).</div>",
+            unsafe_allow_html=True
+        )
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Consolidado + descarga
+    # ============================================================
+    # Consolidado con títulos CLAROS
+    # ============================================================
     st.subheader("📊 Consolidado")
+
     df_out = pd.DataFrame(results_rows).copy()
 
-    # Formateo agradable para vista (sin afectar descarga)
-    df_show = df_out.copy()
-    pct_cols = [c for c in df_show.columns if c.endswith("_%")]
+    rename_map = {
+        "archivo": "Archivo",
+
+        "pg_no_%": "Percepción general – No (%)",
+        "pg_si_%": "Percepción general – Sí (%)",
+
+        "ca_menos_seguro_%": "Comparación año anterior – Menos seguro (%)",
+        "ca_igual_%": "Comparación año anterior – Igual (%)",
+        "ca_mas_seguro_%": "Comparación año anterior – Más seguro (%)",
+
+        "sp_excelente_%": "Servicio policial – Excelente (%)",
+        "sp_buena_%": "Servicio policial – Buena (%)",
+        "sp_regular_%": "Servicio policial – Regular (%)",
+        "sp_mala_%": "Servicio policial – Mala (%)",
+        "sp_muy_mala_%": "Servicio policial – Muy mala (%)",
+
+        "ua_igual_%": "Último año – Igual (%)",
+        "ua_mejor_%": "Último año – Mejor servicio (%)",
+        "ua_peor_%": "Último año – Peor servicio (%)",
+
+        "puntaje_percepcion_general": "Puntaje percepción general",
+        "puntaje_comparacion_anio_anterior": "Puntaje comparación año anterior",
+        "puntaje_servicio_policial": "Puntaje servicio policial",
+        "puntaje_ultimo_anio": "Puntaje último año",
+
+        "percepcion_del_entorno": "Percepción del entorno",
+        "desempeno_policia": "Desempeño policial",
+        "indice_global": "Índice global",
+        "nivel_indice": "Nivel del índice",
+    }
+
+    df_show = df_out.rename(columns=rename_map).copy()
+
+    # Formato visual (manteniendo df_out numérico para export si quisieras)
+    pct_cols = [c for c in df_show.columns if c.endswith("(%)")]
     for c in pct_cols:
         df_show[c] = df_show[c].map(lambda x: f"{float(x):.2f}%")
-    num_cols = ["puntaje_percepcion_general","puntaje_comparacion_anio_anterior","puntaje_servicio_policial","puntaje_ultimo_anio",
-                "percepcion_del_entorno","desempeno_policia","indice_global"]
+
+    num_cols = [
+        "Puntaje percepción general", "Puntaje comparación año anterior", "Puntaje servicio policial", "Puntaje último año",
+        "Percepción del entorno", "Desempeño policial", "Índice global"
+    ]
     for c in num_cols:
-        df_show[c] = df_show[c].map(lambda x: f"{float(x):.3f}")
+        if c in df_show.columns:
+            df_show[c] = df_show[c].map(lambda x: f"{float(x):.3f}")
 
-    st.dataframe(df_show.sort_values("indice_global", ascending=True), use_container_width=True)
+    st.dataframe(df_show.sort_values("Índice global", ascending=True), use_container_width=True)
 
+    # Descargar: también con títulos claros
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="consolidado")  # descarga numérica real
+        # Exporto df_show pero en versión NUMÉRICA para Excel (sin % como texto)
+        df_export = df_out.rename(columns=rename_map).copy()
+        df_export.to_excel(writer, index=False, sheet_name="consolidado")
+
     st.download_button(
         "⬇️ Descargar consolidado (Excel)",
         data=bio.getvalue(),
