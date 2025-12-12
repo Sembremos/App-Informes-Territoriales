@@ -1,8 +1,10 @@
-streamlit
-pandas
-PyMuPDF
-pdfplumber
-pytesseract
+streamlit==1.37.1
+pandas==2.2.2
+PyMuPDF==1.24.10
+pillow==10.4.0
+numpy==2.0.1
+pytesseract==0.3.10
+
 
 
 
