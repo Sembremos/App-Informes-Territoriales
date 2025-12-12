@@ -1,15 +1,16 @@
 import re
 import unicodedata
 from typing import Dict, List, Optional, Tuple
+import colorsys
 
 import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
 
 
-# =========================================================
-# Utilidades básicas
-# =========================================================
+# =========================
+# Utils
+# =========================
 PCT_RE = re.compile(r"(\d{1,3}[.,]\d{1,2})\s*%")
 
 def norm(s: str) -> str:
@@ -41,39 +42,32 @@ def fmt_pct(x) -> Optional[str]:
         return f"{x:.2f}%"
     return None
 
-def color_dist(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
-    return ((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) ** 0.5
-
-
-# =========================================================
-# Render + muestreo de color (sin OCR)
-# =========================================================
 def render_page(page: fitz.Page, zoom: float = 2.0) -> Tuple[fitz.Pixmap, float]:
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     return pix, zoom
 
-def sample_rgb(pix: fitz.Pixmap, x: float, y: float, radius: int = 3) -> Tuple[float, float, float]:
+def sample_rgb(pix: fitz.Pixmap, x: float, y: float, radius: int = 4) -> Tuple[float, float, float]:
+    """Promedio RGB (0..1) alrededor de (x,y) en coordenadas de pixmap."""
     w, h = pix.width, pix.height
     x = int(max(0, min(w - 1, x)))
     y = int(max(0, min(h - 1, y)))
 
-    r_sum = g_sum = b_sum = 0
-    n = 0
-
     samples = pix.samples
     stride = pix.stride
 
+    r_sum = g_sum = b_sum = 0
+    n = 0
     for dy in range(-radius, radius + 1):
         yy = y + dy
         if yy < 0 or yy >= h:
             continue
-        row_start = yy * stride
+        row = yy * stride
         for dx in range(-radius, radius + 1):
             xx = x + dx
             if xx < 0 or xx >= w:
                 continue
-            idx = row_start + xx * 3
+            idx = row + xx * 3
             r_sum += samples[idx]
             g_sum += samples[idx + 1]
             b_sum += samples[idx + 2]
@@ -81,13 +75,12 @@ def sample_rgb(pix: fitz.Pixmap, x: float, y: float, radius: int = 3) -> Tuple[f
 
     if n == 0:
         return (0.0, 0.0, 0.0)
-
     return (r_sum / n / 255.0, g_sum / n / 255.0, b_sum / n / 255.0)
 
 
-# =========================================================
-# Búsqueda de página y delegación
-# =========================================================
+# =========================
+# Identificar página + delegación
+# =========================
 def find_page_percepcion_ciudadana(doc: fitz.Document) -> Optional[int]:
     anchors = ["percepcion ciudadana", "se siente de seguro en su comunidad"]
     for i in range(doc.page_count):
@@ -105,12 +98,13 @@ def extract_delegacion(doc: fitz.Document) -> str:
     return "SIN_DELEGACIÓN"
 
 
-# =========================================================
-# Extracción: pastel + comparación
-# =========================================================
+# =========================
+# Pastel (Seguro / Inseguro)
+# =========================
 def extract_pie_seguro_inseguro(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Tuple[Optional[float], Optional[float]]:
+    # Tomamos porcentajes del lado izquierdo (pastel). Elegimos 2 distintos.
     words = page.get_text("words")
-    vals = []
+    vals: List[float] = []
     for (x0, y0, x1, y1, w, *_rest) in words:
         cx = (x0 + x1) / 2.0
         cy = (y0 + y1) / 2.0
@@ -122,7 +116,7 @@ def extract_pie_seguro_inseguro(page: fitz.Page, midx: float, y_start: float, y_
         if v is not None:
             vals.append(v)
 
-    uniq = []
+    uniq: List[float] = []
     for v in sorted(vals, reverse=True):
         if all(abs(v - u) > 0.2 for u in uniq):
             uniq.append(v)
@@ -137,70 +131,9 @@ def extract_pie_seguro_inseguro(page: fitz.Page, midx: float, y_start: float, y_
     return (seguro, inseguro)
 
 
-def find_legend_label_positions(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Tuple[float, float]]:
-    words = page.get_text("words")  # x0,y0,x1,y1,word,block,line,wordno
-    by_line = {}
-    for (x0, y0, x1, y1, w, b, ln, wn) in words:
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
-        if cx < midx:
-            continue
-        if cy < y_start or cy > y_end:
-            continue
-        by_line.setdefault((b, ln), []).append((x0, y0, x1, y1, cx, cy, w))
-
-    best = {}
-    for (_b, _ln), items in by_line.items():
-        items = sorted(items, key=lambda t: t[0])
-        line_txt = norm(" ".join(w for *_, w in items))
-        cx_line = sum(t[4] for t in items) / len(items)
-        cy_line = sum(t[5] for t in items) / len(items)
-
-        if ("igual" == line_txt) or line_txt.startswith("igual "):
-            if "igual" not in best or cy_line > best["igual"][1]:
-                best["igual"] = (cx_line, cy_line)
-        if "mas seguro" in line_txt:
-            if "mas" not in best or cy_line > best["mas"][1]:
-                best["mas"] = (cx_line, cy_line)
-        if "menos seguro" in line_txt:
-            if "menos" not in best or cy_line > best["menos"][1]:
-                best["menos"] = (cx_line, cy_line)
-
-    return best
-
-
-def find_nearest_legend_square(page: fitz.Page, target_xy: Tuple[float, float], midx: float, y_start: float, y_end: float) -> Optional[fitz.Rect]:
-    tx, ty = target_xy
-    drawings = page.get_drawings()
-    candidates = []
-
-    for d in drawings:
-        for it in d.get("items", []):
-            if not it or it[0] != "re":
-                continue
-            r = it[1]
-            cx = (r.x0 + r.x1) / 2.0
-            cy = (r.y0 + r.y1) / 2.0
-            if cx < midx:
-                continue
-            if cy < y_start or cy > y_end:
-                continue
-
-            w = r.x1 - r.x0
-            h = r.y1 - r.y0
-
-            if w < 70 and h < 70:
-                if cx < tx and abs(cy - ty) <= 30 and (tx - cx) <= 260:
-                    score = abs(cy - ty) * 10 + (tx - cx)
-                    candidates.append((score, r))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda t: t[0])
-    return candidates[0][1]
-
-
+# =========================
+# Barras (Comparación 2023)
+# =========================
 def find_bar_rects(page: fitz.Page, midx: float, y_start: float, y_end: float) -> List[fitz.Rect]:
     drawings = page.get_drawings()
     bars = []
@@ -211,33 +144,36 @@ def find_bar_rects(page: fitz.Page, midx: float, y_start: float, y_end: float) -
             r = it[1]
             cx = (r.x0 + r.x1) / 2.0
             cy = (r.y0 + r.y1) / 2.0
+
             if cx < midx:
                 continue
             if cy < y_start or cy > y_end:
                 continue
+
             w = r.x1 - r.x0
             h = r.y1 - r.y0
-            if h > 90 and w > 15 and w < 280:
+
+            # barras típicas
+            if h > 90 and w > 12 and w < 340:
                 bars.append((h, cx, r))
 
     if not bars:
         return []
 
+    # coger top por altura y quedarnos con 3 x distintos
     bars.sort(key=lambda t: t[0], reverse=True)
-    top = bars[:12]
+    top = bars[:16]
 
     picked: List[fitz.Rect] = []
-    picked_cx: List[float] = []
-
+    picked_x: List[float] = []
     for _h, cx, r in sorted(top, key=lambda t: t[1]):
-        if all(abs(cx - pcx) > 25 for pcx in picked_cx):
+        if all(abs(cx - px) > 22 for px in picked_x):
             picked.append(r)
-            picked_cx.append(cx)
+            picked_x.append(cx)
         if len(picked) == 3:
             break
 
     return picked
-
 
 def extract_bar_percentages(page: fitz.Page, bars: List[fitz.Rect], midx: float, y_start: float, y_end: float) -> List[Optional[float]]:
     words = page.get_text("words")
@@ -252,6 +188,7 @@ def extract_bar_percentages(page: fitz.Page, bars: List[fitz.Rect], midx: float,
             continue
         pct_points.append((v, cx, cy))
 
+    # dedupe por valor
     uniq = []
     for v, x, y in sorted(pct_points, key=lambda t: (t[0], t[2])):
         if all(abs(v - u[0]) > 0.2 for u in uniq):
@@ -262,12 +199,14 @@ def extract_bar_percentages(page: fitz.Page, bars: List[fitz.Rect], midx: float,
         bx = (r.x0 + r.x1) / 2.0
         best = None
         for (v, x, y) in uniq:
+            # debe estar sobre la barra
             if y >= r.y0:
                 continue
-            if y < r.y0 - 420:
+            # ventana vertical razonable
+            if y < r.y0 - 520:
                 continue
             dx = abs(x - bx)
-            if dx > 260:
+            if dx > 300:
                 continue
             score = dx + (r.y0 - y) * 0.05
             if best is None or score < best[0]:
@@ -276,27 +215,33 @@ def extract_bar_percentages(page: fitz.Page, bars: List[fitz.Rect], midx: float,
 
     return out
 
+def classify_bar_color(rgb: Tuple[float, float, float]) -> str:
+    """
+    Clasificación robusta por color (SIN leyenda):
+    - gris = Igual
+    - celeste = Más seguro
+    - azul oscuro = Menos seguro
+    """
+    r, g, b = rgb
 
-def extract_comp_comparison(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Optional[float]]:
-    labels = find_legend_label_positions(page, midx, y_start, y_end)
-    if not all(k in labels for k in ("igual", "mas", "menos")):
-        return {
-            "Comparación 2023 - Igual (%)": None,
-            "Comparación 2023 - Más seguro (%)": None,
-            "Comparación 2023 - Menos seguro (%)": None,
-        }
+    # "gris": canales parecidos y baja saturación
+    if abs(r - g) < 0.08 and abs(g - b) < 0.08:
+        return "igual"
 
-    sq_rects = {}
-    for cat in ("igual", "mas", "menos"):
-        sq_rects[cat] = find_nearest_legend_square(page, labels[cat], midx, y_start, y_end)
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
 
-    if any(sq_rects[c] is None for c in sq_rects):
-        return {
-            "Comparación 2023 - Igual (%)": None,
-            "Comparación 2023 - Más seguro (%)": None,
-            "Comparación 2023 - Menos seguro (%)": None,
-        }
+    # si saturación es muy baja, también gris
+    if s < 0.18:
+        return "igual"
 
+    # tonos azules: hue aprox 0.50 a 0.75
+    # (no lo forzamos demasiado; MPGP es azul/celeste)
+    # diferenciar celeste vs azul oscuro por "v" (brillo)
+    if v < 0.55:
+        return "menos"  # azul más oscuro
+    return "mas"        # celeste más brillante
+
+def extract_comp_comparison_by_bar_color(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Optional[float]]:
     bars = find_bar_rects(page, midx, y_start, y_end)
     if len(bars) != 3:
         return {
@@ -305,45 +250,23 @@ def extract_comp_comparison(page: fitz.Page, midx: float, y_start: float, y_end:
             "Comparación 2023 - Menos seguro (%)": None,
         }
 
-    pix, zoom = render_page(page, zoom=2.0)
-
-    # colores de leyenda (muestreo REAL)
-    legend_colors = {}
-    for cat, r in sq_rects.items():
-        cx = (r.x0 + r.x1) / 2.0
-        cy = (r.y0 + r.y1) / 2.0
-        legend_colors[cat] = sample_rgb(pix, cx * zoom, cy * zoom, radius=4)
-
-    # colores de barras (muestreo REAL dentro de la barra)
-    bar_colors = []
-    for r in bars:
-        cx = (r.x0 + r.x1) / 2.0
-        cy = (r.y0 + r.y1) / 2.0
-        # sample más adentro para evitar borde/sombra
-        bar_colors.append(sample_rgb(pix, cx * zoom, cy * zoom, radius=6))
-
-    # porcentajes por barra
     bar_pcts = extract_bar_percentages(page, bars, midx, y_start, y_end)
 
-    # asignación por distancia de color (con garantía: 1 barra por categoría)
+    pix, zoom = render_page(page, zoom=2.0)
+
     assigned = {"igual": None, "mas": None, "menos": None}
-    used_bar = set()
 
-    def pick_best_bar_for_cat(cat: str) -> Optional[int]:
-        best = None
-        for i, c in enumerate(bar_colors):
-            if i in used_bar:
-                continue
-            d = color_dist(c, legend_colors[cat])
-            if best is None or d < best[0]:
-                best = (d, i)
-        return best[1] if best else None
+    for r, pct in zip(bars, bar_pcts):
+        cx = (r.x0 + r.x1) / 2.0
+        # muestrear dentro, cerca del tercio superior (evita sombras)
+        y_inside = r.y0 + (r.y1 - r.y0) * 0.35
+        rgb = sample_rgb(pix, cx * zoom, y_inside * zoom, radius=6)
+        cat = classify_bar_color(rgb)
 
-    for cat in ("igual", "mas", "menos"):
-        idx = pick_best_bar_for_cat(cat)
-        if idx is not None:
-            used_bar.add(idx)
-            assigned[cat] = bar_pcts[idx]
+        # si por alguna razón dos barras caen en misma clase, guardamos la más "coherente":
+        # regla: si ya existe y el nuevo pct es None, no sobreescribir
+        if assigned[cat] is None or (assigned[cat] is not None and pct is not None):
+            assigned[cat] = pct
 
     return {
         "Comparación 2023 - Igual (%)": assigned["igual"],
@@ -352,9 +275,9 @@ def extract_comp_comparison(page: fitz.Page, midx: float, y_start: float, y_end:
     }
 
 
-# =========================================================
+# =========================
 # Extract principal (solo estos datos)
-# =========================================================
+# =========================
 def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float]]:
     out = {
         "Delegación": extract_delegacion(doc),
@@ -371,34 +294,28 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float
 
     page = doc[pidx]
 
-    # =========================
-    # FIX CLAVE: NO cortar por "Fuente:"
-    # Usar ventana amplia y estable que incluye leyenda SIEMPRE
-    # =========================
-    y_start = page.rect.height * 0.18
-    y_end   = page.rect.height * 0.90
+    # Ventana amplia estable (incluye todo el bloque)
+    y_start = page.rect.height * 0.16
+    y_end   = page.rect.height * 0.92
     midx    = page.rect.width  * 0.52
 
-    # Pastel
     seguro, inseguro = extract_pie_seguro_inseguro(page, midx, y_start, y_end)
     out["Seguro en la comunidad (%)"] = seguro
     out["Inseguro en la comunidad (%)"] = inseguro
 
-    # Barras comparación
-    out.update(extract_comp_comparison(page, midx, y_start, y_end))
-
+    out.update(extract_comp_comparison_by_bar_color(page, midx, y_start, y_end))
     return out
 
 
-# =========================================================
+# =========================
 # Streamlit UI
-# =========================================================
+# =========================
 st.set_page_config(page_title="MPGP - Extractor", layout="wide")
 st.title("MPGP — Extractor (Percepción ciudadana)")
 
 st.caption(
     "Extrae: Seguro/Inseguro y Comparación 2023 (Igual, Más seguro, Menos seguro). "
-    "Sin OCR, soporta cambios de orden y de formato."
+    "NO usa OCR. NO depende de la leyenda. Clasifica por color de barras."
 )
 
 files = st.file_uploader(
@@ -414,22 +331,28 @@ if files:
         doc = fitz.open(stream=f.read(), filetype="pdf")
         data = extract_percepcion_ciudadana(doc)
         doc.close()
-
         rows.append({"Archivo": f.name, **data})
         prog.progress(int(i / len(files) * 100))
     prog.empty()
 
     df = pd.DataFrame(rows)
 
-    # Formato %
-    for col in [
+    # ordenar columnas como querés verlas
+    cols = [
+        "Archivo",
+        "Delegación",
         "Seguro en la comunidad (%)",
         "Inseguro en la comunidad (%)",
         "Comparación 2023 - Igual (%)",
         "Comparación 2023 - Más seguro (%)",
         "Comparación 2023 - Menos seguro (%)",
-    ]:
-        df[col] = df[col].map(fmt_pct)
+    ]
+    df = df[[c for c in cols if c in df.columns]]
+
+    # Formato %
+    for col in cols[2:]:
+        if col in df.columns:
+            df[col] = df[col].map(fmt_pct)
 
     st.subheader("Resultados (tabla)")
     st.dataframe(df, use_container_width=True)
