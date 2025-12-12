@@ -9,7 +9,7 @@ st.set_page_config(page_title="Índice Territorial — Lectura masiva de Excel",
 
 
 # ============================================================
-# Normalización / utilidades
+# Normalización / conversión
 # ============================================================
 def norm(x: Any) -> str:
     if x is None:
@@ -17,6 +17,8 @@ def norm(x: Any) -> str:
     s = str(x).strip().lower()
     s = s.replace("\n", " ").replace("\r", " ")
     s = " ".join(s.split())
+    # normaliza tildes comunes mínimas (para robustez sin librerías extra)
+    s = s.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u").replace("ü", "u").replace("ñ", "n")
     return s
 
 def to_pct(x: Any) -> Optional[float]:
@@ -26,7 +28,7 @@ def to_pct(x: Any) -> Optional[float]:
         v = float(x)
     except Exception:
         return None
-    # si viene 0-1
+    # Si viene 0-1, lo pasamos a 0-100
     if 0 <= v <= 1.5:
         v *= 100.0
     return v
@@ -40,10 +42,10 @@ def classify_index(x: float) -> str:
         return "Medio (40,1-60)"
     if x <= 80:
         return "Alto (60,1-80)"
-    return "Muy Alto (80,1-100)"
+    return "Muy Alto (80-100)"
 
 def level_color(level: str) -> str:
-    if "Crítico" in level:
+    if "Critico" in norm(level):
         return "#ff4d4d"
     if "Bajo" in level:
         return "#ffb84d"
@@ -55,185 +57,275 @@ def level_color(level: str) -> str:
 
 
 # ============================================================
-# Cálculo (según tu lógica)
-# ============================================================
-PG_WEIGHTS = {"inseguro": 0.0, "seguro": 1.0}
-CA_WEIGHTS = {"menos_seguro": 0.0, "igual": 0.5, "mas_seguro": 1.0}
-SP_WEIGHTS = {"excelente": 1.0, "buena": 0.75, "regular": 0.50, "mala": 0.0, "muy_mala": 0.0}
-UA_WEIGHTS = {"peor": 0.0, "igual": 0.5, "mejor": 1.0}
-
-def score_from_percentages(pcts: Dict[str, float], weights: Dict[str, float]) -> float:
-    return sum(float(pcts.get(k, 0.0) or 0.0) * w for k, w in weights.items())
-
-
-# ============================================================
-# Lectura OPENPYXL (celdas combinadas)
+# Lectura robusta: incluye merges (celdas combinadas)
 # ============================================================
 def sheet_to_matrix(ws) -> List[List[Any]]:
-    # Construye una matriz de valores (incluyendo merges “arrastrando” el valor al resto)
     max_r = ws.max_row or 1
     max_c = ws.max_column or 1
 
-    # mapa para merges: (r,c) -> valor del topleft
+    # rellena merges: cada celda del rango recibe el valor del topleft
     merge_map = {}
     for mr in ws.merged_cells.ranges:
-        min_row, min_col, max_row, max_col = mr.min_row, mr.min_col, mr.max_row, mr.max_col
-        top_val = ws.cell(min_row, min_col).value
-        for r in range(min_row, max_row + 1):
-            for c in range(min_col, max_col + 1):
+        top_val = ws.cell(mr.min_row, mr.min_col).value
+        for r in range(mr.min_row, mr.max_row + 1):
+            for c in range(mr.min_col, mr.max_col + 1):
                 merge_map[(r, c)] = top_val
 
-    matrix = []
+    mat = []
     for r in range(1, max_r + 1):
-        row_vals = []
+        row = []
         for c in range(1, max_c + 1):
-            val = ws.cell(r, c).value
-            if val is None and (r, c) in merge_map:
-                val = merge_map[(r, c)]
-            row_vals.append(val)
-        matrix.append(row_vals)
-    return matrix
+            v = ws.cell(r, c).value
+            if v is None and (r, c) in merge_map:
+                v = merge_map[(r, c)]
+            row.append(v)
+        mat.append(row)
+    return mat
 
 
 # ============================================================
-# Detección por estructura de tablas
-# (Respuesta | Porcentaje) y etiquetas esperadas
+# Detección de tablas por título + columna porcentaje
 # ============================================================
-def find_header_positions(mat: List[List[Any]]) -> List[Tuple[int, int, int]]:
-    """
-    Encuentra filas donde existan headers tipo:
-    - "respuesta" y "porcentaje" en la misma fila
-    Retorna lista de tuplas: (row_index, col_respuesta, col_porcentaje)
-    """
-    positions = []
+def find_title_cells(mat: List[List[Any]], title_needles: List[str]) -> List[Tuple[int, int]]:
+    needles = [norm(n) for n in title_needles]
+    hits = []
     for r, row in enumerate(mat):
-        row_norm = [norm(x) for x in row]
-        # buscar "respuesta"
-        res_cols = [c for c, v in enumerate(row_norm) if v == "respuesta" or "respuesta" in v]
-        pct_cols = [c for c, v in enumerate(row_norm) if v == "porcentaje" or v == "%" or "porcentaje" in v]
-        if res_cols and pct_cols:
-            # escogemos la primera combinación más cercana
-            rc = res_cols[0]
-            pc = min(pct_cols, key=lambda x: abs(x - rc))
-            positions.append((r, rc, pc))
-    return positions
+        for c, cell in enumerate(row):
+            t = norm(cell)
+            if not t:
+                continue
+            for nd in needles:
+                # match por contains (robusto)
+                if nd and nd in t:
+                    hits.append((r, c))
+                    break
+    return hits
 
-def read_table(mat: List[List[Any]], header_r: int, col_label: int, col_pct: int, max_rows: int = 20) -> Dict[str, float]:
+def find_pct_column_near(mat: List[List[Any]], anchor_r: int, search_rows: int = 12) -> Optional[int]:
+    # Busca una columna con header "porcentaje" o "%" cerca del anchor
+    candidates = []
+    r0 = max(0, anchor_r)
+    r1 = min(len(mat), anchor_r + search_rows)
+    for r in range(r0, r1):
+        row = mat[r]
+        for c, cell in enumerate(row):
+            t = norm(cell)
+            if t in ("%",) or "porcentaje" in t:
+                candidates.append(c)
+    if not candidates:
+        return None
+    # elige la más frecuente
+    return max(set(candidates), key=candidates.count)
+
+def read_table_down(mat: List[List[Any]], start_r: int, pct_col: int, max_rows: int = 30) -> Dict[str, float]:
     """
-    Lee debajo del header hasta que se acaben etiquetas.
+    Lee filas debajo del título buscando:
+      - etiqueta en cualquier columna de la fila
+      - % en pct_col
+    Retorna dict: etiqueta_normalizada -> porcentaje
     """
-    out = {}
-    for rr in range(header_r + 1, min(len(mat), header_r + 1 + max_rows)):
-        label = norm(mat[rr][col_label] if col_label < len(mat[rr]) else None)
-        pct = to_pct(mat[rr][col_pct] if col_pct < len(mat[rr]) else None)
-        if not label:
-            # si la fila está vacía, paramos
-            # pero si hay números sueltos seguimos 1 fila más por si hay merges
-            if pct is None:
+    out: Dict[str, float] = {}
+    r1 = min(len(mat), start_r + max_rows)
+
+    for r in range(start_r + 1, r1):
+        row = mat[r]
+        pct = to_pct(row[pct_col] if pct_col < len(row) else None)
+
+        # etiqueta: buscamos la primera celda tipo texto “no vacía” en la fila
+        label = ""
+        for c in range(len(row)):
+            txt = norm(row[c])
+            # descarta headers típicos
+            if txt and ("porcentaje" not in txt) and txt not in ("respuesta", "total", "comunidad", "comercio", "%"):
+                label = txt
                 break
+
+        if not label and pct is None:
+            # fin lógico de tabla
             continue
-        if pct is None:
-            continue
-        out[label] = float(pct)
+
+        # si hay label y porcentaje, lo guardamos
+        if label and pct is not None:
+            out[label] = float(pct)
+
     return out
 
-def match_block(table: Dict[str, float], expected_any: List[str]) -> bool:
-    """
-    Verifica si la tabla contiene suficientes etiquetas esperadas (por texto normalizado).
-    """
-    keys = set(table.keys())
+def match_labels(table: Dict[str, float], needed_any: List[str]) -> bool:
+    keys = list(table.keys())
     hits = 0
-    for e in expected_any:
-        e = norm(e)
-        if any(e == k or e in k for k in keys):
+    for n in needed_any:
+        nn = norm(n)
+        if any(nn == k or nn in k for k in keys):
             hits += 1
-    return hits >= max(2, len(expected_any) // 2)
+    return hits >= max(2, len(needed_any) // 2)
 
-def extract_blocks_from_matrix(mat: List[List[Any]]) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]], Optional[Dict[str, float]], Optional[Dict[str, float]], List[str]]:
+def get_value_contains(table: Dict[str, float], needle: str) -> float:
+    nd = norm(needle)
+    for k, v in table.items():
+        if nd == k or nd in k:
+            return float(v)
+    return 0.0
+
+
+# ============================================================
+# Bloques que necesitamos (títulos + etiquetas esperadas)
+# ============================================================
+BLOCKS = {
+    "PG": {
+        "titles": [
+            "se siente seguro en su comunidad",
+            "se siente seguro en la comunidad",
+            "siente seguro en su comunidad",
+        ],
+        "expect": ["no", "si", "sí"],
+    },
+    "CA": {
+        "titles": [
+            "en comparacion con el ano anterior",
+            "en comparación con el año anterior",
+            "comparacion con el ano anterior",
+            "comparación con el año anterior",
+        ],
+        "expect": ["igual", "mas seguro", "más seguro", "menos seguro"],
+    },
+    "SP": {
+        "titles": [
+            "percepcion del servicio policial",
+            "percepcion servicio policial",
+            "percepción del servicio policial",
+        ],
+        "expect": ["excelente", "buena", "regular", "mala", "muy mala"],
+    },
+    "UA": {
+        "titles": [
+            "calificacion del servicio policial del ultimo ano",
+            "calificacion del servicio policial del ultimo de ano",
+            "calificación del servicio policial del ultimo año",
+            "calificacion del servicio policial del ultimo año",
+        ],
+        "expect": ["igual", "mejor", "peor"],
+    },
+}
+
+# Pesos
+PG_W = {"inseguro": 0.0, "seguro": 1.0}
+CA_W = {"menos_seguro": 0.0, "igual": 0.5, "mas_seguro": 1.0}
+SP_W = {"excelente": 1.0, "buena": 0.75, "regular": 0.50, "mala": 0.0, "muy_mala": 0.0}
+UA_W = {"peor": 0.0, "igual": 0.5, "mejor": 1.0}
+
+def score(table_map: Dict[str, float], weights: Dict[str, float]) -> float:
+    return sum(float(table_map.get(k, 0.0) or 0.0) * w for k, w in weights.items())
+
+def extract_from_workbook(wb) -> Tuple[Optional[Dict[str, Any]], List[str], Dict[str, Any]]:
     """
-    Busca todas las tablas y asigna:
-    - PG: No/Sí
-    - CA: Igual/Más/Menos
-    - SP: Excelente/Buena/Regular/Mala/Muy Mala
-    - UA: Igual/Mejor/Peor
+    Devuelve:
+      - result dict (si se pudo)
+      - lista de errores
+      - debug info (por si falla)
     """
+    debug = {"hojas": []}
+
+    found_pg = found_ca = found_sp = found_ua = None
+
+    for sname in wb.sheetnames:
+        ws = wb[sname]
+        mat = sheet_to_matrix(ws)
+
+        sheet_debug = {"hoja": sname, "hits": {}}
+
+        # intentar cada bloque en esta hoja
+        for key, cfg in BLOCKS.items():
+            if (key == "PG" and found_pg) or (key == "CA" and found_ca) or (key == "SP" and found_sp) or (key == "UA" and found_ua):
+                continue
+
+            title_cells = find_title_cells(mat, cfg["titles"])
+            sheet_debug["hits"][key] = len(title_cells)
+
+            for (tr, tc) in title_cells:
+                pct_col = find_pct_column_near(mat, tr, search_rows=14)
+                if pct_col is None:
+                    continue
+                tbl = read_table_down(mat, tr, pct_col, max_rows=40)
+                if match_labels(tbl, cfg["expect"]):
+                    # asignar al bloque correspondiente
+                    if key == "PG" and not found_pg:
+                        found_pg = tbl
+                    elif key == "CA" and not found_ca:
+                        found_ca = tbl
+                    elif key == "SP" and not found_sp:
+                        found_sp = tbl
+                    elif key == "UA" and not found_ua:
+                        found_ua = tbl
+
+        debug["hojas"].append(sheet_debug)
+
+        # si ya están los 4, salimos
+        if found_pg and found_ca and found_sp and found_ua:
+            break
+
     errors = []
-    headers = find_header_positions(mat)
+    if not found_pg: errors.append("No detecté la tabla de Percepción General (No/Sí).")
+    if not found_ca: errors.append("No detecté la tabla de Comparación Año Anterior (Igual/Más/Menos).")
+    if not found_sp: errors.append("No detecté la tabla de Percepción del Servicio Policial (Excelente…Muy Mala).")
+    if not found_ua: errors.append("No detecté la tabla de Calificación del Último Año (Igual/Mejor/Peor).")
 
-    pg = ca = sp = ua = None
+    if errors:
+        return None, errors, debug
 
-    for (hr, c_label, c_pct) in headers:
-        tbl = read_table(mat, hr, c_label, c_pct)
+    # Mapear a llaves usadas para calcular
+    pg_map = {
+        "inseguro": get_value_contains(found_pg, "no"),
+        "seguro": get_value_contains(found_pg, "si") or get_value_contains(found_pg, "sí"),
+    }
+    ca_map = {
+        "igual": get_value_contains(found_ca, "igual"),
+        "mas_seguro": get_value_contains(found_ca, "mas seguro") or get_value_contains(found_ca, "más seguro"),
+        "menos_seguro": get_value_contains(found_ca, "menos seguro"),
+    }
+    sp_map = {
+        "excelente": get_value_contains(found_sp, "excelente"),
+        "buena": get_value_contains(found_sp, "buena"),
+        "regular": get_value_contains(found_sp, "regular"),
+        "mala": get_value_contains(found_sp, "mala"),
+        "muy_mala": get_value_contains(found_sp, "muy mala"),
+    }
+    ua_map = {
+        "igual": get_value_contains(found_ua, "igual"),
+        "mejor": get_value_contains(found_ua, "mejor"),
+        "peor": get_value_contains(found_ua, "peor"),
+    }
 
-        # PG
-        if pg is None and match_block(tbl, ["no", "sí", "si"]):
-            # map
-            pg = {
-                "inseguro": tbl.get("no", 0.0),
-                "seguro": tbl.get("sí", tbl.get("si", 0.0)),
-            }
-            continue
+    # Puntajes
+    s_pg = score(pg_map, PG_W)
+    s_ca = score(ca_map, CA_W)
+    s_sp = score(sp_map, SP_W)
+    s_ua = score(ua_map, UA_W)
 
-        # CA
-        if ca is None and match_block(tbl, ["igual", "más seguro", "mas seguro", "menos seguro"]):
-            # buscar por contains
-            def get_contains(k):
-                for kk, vv in tbl.items():
-                    if k in kk:
-                        return vv
-                return 0.0
-            ca = {
-                "igual": get_contains("igual"),
-                "mas_seguro": get_contains("mas seguro") or get_contains("más seguro"),
-                "menos_seguro": get_contains("menos seguro"),
-            }
-            continue
+    entorno = (s_pg + s_ca) / 2.0
+    policia = (s_sp + s_ua) / 2.0
+    idx = (entorno + policia) / 2.0
+    level = classify_index(idx)
 
-        # SP
-        if sp is None and match_block(tbl, ["excelente", "buena", "regular", "mala", "muy mala"]):
-            def get_exact_or_contains(k):
-                for kk, vv in tbl.items():
-                    if kk == k or k in kk:
-                        return vv
-                return 0.0
-            sp = {
-                "excelente": get_exact_or_contains("excelente"),
-                "buena": get_exact_or_contains("buena"),
-                "regular": get_exact_or_contains("regular"),
-                "mala": get_exact_or_contains("mala"),
-                "muy_mala": get_exact_or_contains("muy mala"),
-            }
-            continue
-
-        # UA
-        if ua is None and match_block(tbl, ["igual", "mejor", "peor"]):
-            def get_contains_one(k):
-                for kk, vv in tbl.items():
-                    if k in kk:
-                        return vv
-                return 0.0
-            ua = {
-                "igual": get_contains_one("igual"),
-                "mejor": get_contains_one("mejor"),
-                "peor": get_contains_one("peor"),
-            }
-            continue
-
-    if pg is None: errors.append("No pude detectar la tabla de Percepción General (No/Sí).")
-    if ca is None: errors.append("No pude detectar la tabla de Comparación Año Anterior (Igual/Más/Menos).")
-    if sp is None: errors.append("No pude detectar la tabla de Percepción del Servicio Policial (Excelente…Muy Mala).")
-    if ua is None: errors.append("No pude detectar la tabla de Calificación del Servicio del Último Año (Igual/Mejor/Peor).")
-
-    return pg, ca, sp, ua, errors
+    result = {
+        "puntaje_percepcion_general": s_pg,
+        "puntaje_comparacion_anio_anterior": s_ca,
+        "puntaje_servicio_policial": s_sp,
+        "puntaje_ultimo_anio": s_ua,
+        "percepcion_del_entorno": entorno,
+        "desempeno_policia": policia,
+        "indice_global": idx,
+        "nivel_indice": level,
+    }
+    return result, [], debug
 
 
 # ============================================================
 # UI
 # ============================================================
 st.title("Índice Territorial — Lectura masiva de Excel")
-st.caption("Esta versión NO depende de títulos en una columna; detecta las tablas por estructura (Respuesta/Porcentaje) y escanea todas las hojas.")
+st.caption("Detecta los cuadros aunque estén en posiciones diferentes. Carga hasta 80 Excel.")
 
-debug = st.toggle("🔎 Mostrar debug (recomendado para detectar por qué no aparece)", value=True)
+show_debug = st.toggle("🔎 Mostrar debug (solo si falla)", value=False)
 
 files = st.file_uploader(
     "Sube hasta 80 archivos Excel (.xlsx / .xlsm)",
@@ -242,76 +334,45 @@ files = st.file_uploader(
 )
 
 if not files:
+    st.info("Sube uno o varios archivos para empezar.")
     st.stop()
 
-results = []
+results_rows = []
 fails = []
 
 for f in files:
     try:
         wb = load_workbook(f, data_only=True)
-        sheet_names = wb.sheetnames
+        res, errs, dbg = extract_from_workbook(wb)
 
-        found = None
-        debug_info = []
-
-        for sname in sheet_names:
-            ws = wb[sname]
-            mat = sheet_to_matrix(ws)
-            pg, ca, sp, ua, errs = extract_blocks_from_matrix(mat)
-
-            debug_info.append({
-                "hoja": sname,
-                "ok": len(errs) == 0,
-                "errores": errs,
-            })
-
-            if len(errs) == 0:
-                found = (sname, pg, ca, sp, ua)
-                break
-
-        if not found:
-            fails.append({"archivo": f.name, "errores": ["No se detectaron las 4 tablas en ninguna hoja."], "debug": debug_info})
+        if errs:
+            fails.append({"archivo": f.name, "errores": errs, "debug": dbg})
             continue
 
-        sname, pg, ca, sp, ua = found
-
-        score_pg = score_from_percentages(pg, PG_WEIGHTS)
-        score_ca = score_from_percentages(ca, CA_WEIGHTS)
-        score_sp = score_from_percentages(sp, SP_WEIGHTS)
-        score_ua = score_from_percentages(ua, UA_WEIGHTS)
-
-        entorno = (score_pg + score_ca) / 2.0
-        policia = (score_sp + score_ua) / 2.0
-        global_idx = (entorno + policia) / 2.0
-        level = classify_index(global_idx)
-
-        results.append({
+        results_rows.append({
             "archivo": f.name,
-            "hoja_detectada": sname,
-            "puntaje_percepcion_general": round(score_pg, 3),
-            "puntaje_comparacion_anio_anterior": round(score_ca, 3),
-            "puntaje_servicio_policial": round(score_sp, 3),
-            "puntaje_ultimo_anio": round(score_ua, 3),
-            "percepcion_del_entorno": round(entorno, 3),
-            "desempeno_policia": round(policia, 3),
-            "indice_global": round(global_idx, 3),
-            "nivel_indice": level,
+            "puntaje_percepcion_general": round(res["puntaje_percepcion_general"], 3),
+            "puntaje_comparacion_anio_anterior": round(res["puntaje_comparacion_anio_anterior"], 3),
+            "puntaje_servicio_policial": round(res["puntaje_servicio_policial"], 3),
+            "puntaje_ultimo_anio": round(res["puntaje_ultimo_anio"], 3),
+            "percepcion_del_entorno": round(res["percepcion_del_entorno"], 3),
+            "desempeno_policia": round(res["desempeno_policia"], 3),
+            "indice_global": round(res["indice_global"], 3),
+            "nivel_indice": res["nivel_indice"],
         })
 
     except Exception as e:
-        fails.append({"archivo": f.name, "errores": [f"Error general: {e}"], "debug": []})
+        fails.append({"archivo": f.name, "errores": [f"Error general leyendo archivo: {e}"], "debug": {}})
 
-# Render
-if results:
+# Mostrar resultados
+if results_rows:
     st.subheader("✅ Resultados")
-    for r in results:
+    for r in results_rows:
         color = level_color(r["nivel_indice"])
         st.markdown(
             f"""
             <div style="border:1px solid rgba(255,255,255,0.15); border-radius:14px; padding:14px; background:rgba(255,255,255,0.04); margin-bottom:12px;">
               <div style="font-weight:800; font-size:16px;">📄 {r["archivo"]}</div>
-              <div style="opacity:0.75; font-size:12px;">Hoja detectada: <b>{r["hoja_detectada"]}</b></div>
 
               <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
                 <div style="padding:10px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); min-width:220px;">
@@ -336,18 +397,22 @@ if results:
 
               <div style="margin-top:10px; font-weight:700;">Puntajes por bloque (0-100):</div>
               <ul style="margin-top:6px;">
-                <li>Percepción General: <b>{r["puntaje_percepcion_general"]:.2f}</b></li>
-                <li>Comparación Año Anterior: <b>{r["puntaje_comparacion_anio_anterior"]:.2f}</b></li>
-                <li>Servicio Policial: <b>{r["puntaje_servicio_policial"]:.2f}</b></li>
-                <li>Último Año: <b>{r["puntaje_ultimo_anio"]:.2f}</b></li>
+                <li>Percepción General (No/Sí): <b>{r["puntaje_percepcion_general"]:.2f}</b></li>
+                <li>Comparación Año Anterior (Menos/Igual/Más): <b>{r["puntaje_comparacion_anio_anterior"]:.2f}</b></li>
+                <li>Servicio Policial (Excelente…Muy Mala): <b>{r["puntaje_servicio_policial"]:.2f}</b></li>
+                <li>Último Año (Igual/Mejor/Peor): <b>{r["puntaje_ultimo_anio"]:.2f}</b></li>
               </ul>
+
+              <div style="opacity:0.75; font-size:12px;">
+                Fórmulas: Entorno = promedio(PG, Comparación). Policía = promedio(Servicio Policial, Último Año). Global = promedio(Entorno, Policía).
+              </div>
             </div>
             """,
             unsafe_allow_html=True
         )
 
     st.subheader("📊 Consolidado")
-    df_out = pd.DataFrame(results).sort_values("indice_global", ascending=True)
+    df_out = pd.DataFrame(results_rows).sort_values("indice_global", ascending=True)
     st.dataframe(df_out, use_container_width=True)
 
     bio = io.BytesIO()
@@ -361,15 +426,13 @@ if results:
     )
 
 if fails:
-    st.subheader("❌ Archivos que no calzaron (con evidencia)")
+    st.subheader("❌ Archivos que no calzaron (detalle)")
     for item in fails:
         with st.expander(item["archivo"], expanded=True):
             for e in item["errores"]:
                 st.write("•", e)
 
-            if debug and item.get("debug"):
-                st.write("Debug por hoja (para ver dónde lo está buscando):")
-                for d in item["debug"]:
-                    st.write(f"- Hoja: **{d['hoja']}** | OK: **{d['ok']}**")
-                    for er in d["errores"]:
-                        st.write(f"   • {er}")
+            if show_debug and item.get("debug"):
+                st.write("Debug (cuántos matches de títulos por hoja):")
+                for h in item["debug"].get("hojas", []):
+                    st.write(f"- Hoja: **{h['hoja']}** | hits: {h['hits']}")
