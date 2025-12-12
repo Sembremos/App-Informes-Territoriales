@@ -1,15 +1,27 @@
 import re
 import unicodedata
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import colorsys
 
-import fitz  # PyMuPDF
-import pandas as pd
 import streamlit as st
+import pandas as pd
+
+# PDFs
+import fitz  # PyMuPDF
+
+# Imágenes + OCR
+from PIL import Image
+import numpy as np
+
+try:
+    import pytesseract
+    TESSERACT_OK = True
+except Exception:
+    TESSERACT_OK = False
 
 
 # =========================
-# Utils
+# Helpers
 # =========================
 PCT_RE = re.compile(r"(\d{1,3}[.,]\d{1,2})\s*%")
 
@@ -42,44 +54,24 @@ def fmt_pct(x) -> Optional[str]:
         return f"{x:.2f}%"
     return None
 
-def render_page(page: fitz.Page, zoom: float = 2.0) -> Tuple[fitz.Pixmap, float]:
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    return pix, zoom
+def classify_bar_color(rgb: Tuple[float, float, float]) -> str:
+    """Clasifica color de barra (MPGP): gris=igual, celeste=mas, azul=menos."""
+    r, g, b = rgb
 
-def sample_rgb(pix: fitz.Pixmap, x: float, y: float, radius: int = 4) -> Tuple[float, float, float]:
-    """Promedio RGB (0..1) alrededor de (x,y) en coordenadas de pixmap."""
-    w, h = pix.width, pix.height
-    x = int(max(0, min(w - 1, x)))
-    y = int(max(0, min(h - 1, y)))
+    # gris: canales parecidos + baja saturación
+    if abs(r - g) < 0.08 and abs(g - b) < 0.08:
+        return "igual"
 
-    samples = pix.samples
-    stride = pix.stride
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    if s < 0.18:
+        return "igual"
 
-    r_sum = g_sum = b_sum = 0
-    n = 0
-    for dy in range(-radius, radius + 1):
-        yy = y + dy
-        if yy < 0 or yy >= h:
-            continue
-        row = yy * stride
-        for dx in range(-radius, radius + 1):
-            xx = x + dx
-            if xx < 0 or xx >= w:
-                continue
-            idx = row + xx * 3
-            r_sum += samples[idx]
-            g_sum += samples[idx + 1]
-            b_sum += samples[idx + 2]
-            n += 1
-
-    if n == 0:
-        return (0.0, 0.0, 0.0)
-    return (r_sum / n / 255.0, g_sum / n / 255.0, b_sum / n / 255.0)
+    # azul oscuro vs celeste por brillo
+    return "menos" if v < 0.55 else "mas"
 
 
 # =========================
-# Identificar página + delegación
+# PDF pipeline (sin OCR)
 # =========================
 def find_page_percepcion_ciudadana(doc: fitz.Document) -> Optional[int]:
     anchors = ["percepcion ciudadana", "se siente de seguro en su comunidad"]
@@ -89,7 +81,7 @@ def find_page_percepcion_ciudadana(doc: fitz.Document) -> Optional[int]:
             return i
     return None
 
-def extract_delegacion(doc: fitz.Document) -> str:
+def extract_delegacion_from_pdf(doc: fitz.Document) -> str:
     for i in range(min(8, doc.page_count)):
         t = doc[i].get_text("text") or ""
         m = re.search(r"\bD\s*-\s*\d+\s+[A-Za-zÁÉÍÓÚÑáéíóúñ\s]+", t)
@@ -97,26 +89,21 @@ def extract_delegacion(doc: fitz.Document) -> str:
             return " ".join(m.group(0).split()).strip()
     return "SIN_DELEGACIÓN"
 
-
-# =========================
-# Pastel (Seguro / Inseguro)
-# =========================
-def extract_pie_seguro_inseguro(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Tuple[Optional[float], Optional[float]]:
-    # Tomamos porcentajes del lado izquierdo (pastel). Elegimos 2 distintos.
+def extract_pie_from_pdf(page: fitz.Page, midx: float, y0: float, y1: float):
     words = page.get_text("words")
-    vals: List[float] = []
-    for (x0, y0, x1, y1, w, *_rest) in words:
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
+    vals = []
+    for (x0, y0w, x1w, y1w, w, *_rest) in words:
+        cx = (x0 + x1w) / 2.0
+        cy = (y0w + y1w) / 2.0
         if cx >= midx:
             continue
-        if cy < y_start or cy > y_end:
+        if cy < y0 or cy > y1:
             continue
         v = parse_pct(w)
         if v is not None:
             vals.append(v)
 
-    uniq: List[float] = []
+    uniq = []
     for v in sorted(vals, reverse=True):
         if all(abs(v - u) > 0.2 for u in uniq):
             uniq.append(v)
@@ -124,17 +111,19 @@ def extract_pie_seguro_inseguro(page: fitz.Page, midx: float, y_start: float, y_
             break
 
     if len(uniq) != 2:
-        return (None, None)
+        return None, None
 
     inseguro = max(uniq)
     seguro = min(uniq)
-    return (seguro, inseguro)
+    return seguro, inseguro
 
+def render_pdf_page(page: fitz.Page, zoom: float = 2.0) -> Tuple[np.ndarray, float]:
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    return img, zoom
 
-# =========================
-# Barras (Comparación 2023)
-# =========================
-def find_bar_rects(page: fitz.Page, midx: float, y_start: float, y_end: float) -> List[fitz.Rect]:
+def find_bar_rects_pdf(page: fitz.Page, midx: float, y0: float, y1: float) -> List[fitz.Rect]:
     drawings = page.get_drawings()
     bars = []
     for d in drawings:
@@ -144,53 +133,45 @@ def find_bar_rects(page: fitz.Page, midx: float, y_start: float, y_end: float) -
             r = it[1]
             cx = (r.x0 + r.x1) / 2.0
             cy = (r.y0 + r.y1) / 2.0
-
             if cx < midx:
                 continue
-            if cy < y_start or cy > y_end:
+            if cy < y0 or cy > y1:
                 continue
-
             w = r.x1 - r.x0
             h = r.y1 - r.y0
-
-            # barras típicas
             if h > 90 and w > 12 and w < 340:
                 bars.append((h, cx, r))
 
     if not bars:
         return []
-
-    # coger top por altura y quedarnos con 3 x distintos
     bars.sort(key=lambda t: t[0], reverse=True)
     top = bars[:16]
 
-    picked: List[fitz.Rect] = []
-    picked_x: List[float] = []
+    picked = []
+    pxs = []
     for _h, cx, r in sorted(top, key=lambda t: t[1]):
-        if all(abs(cx - px) > 22 for px in picked_x):
+        if all(abs(cx - x) > 22 for x in pxs):
             picked.append(r)
-            picked_x.append(cx)
+            pxs.append(cx)
         if len(picked) == 3:
             break
-
     return picked
 
-def extract_bar_percentages(page: fitz.Page, bars: List[fitz.Rect], midx: float, y_start: float, y_end: float) -> List[Optional[float]]:
+def extract_bar_pcts_pdf(page: fitz.Page, bars: List[fitz.Rect], midx: float, y0: float, y1: float) -> List[Optional[float]]:
     words = page.get_text("words")
-    pct_points = []
-    for (x0, y0, x1, y1, w, *_rest) in words:
+    pts = []
+    for (x0, y0w, x1w, y1w, w, *_rest) in words:
         v = parse_pct(w)
         if v is None:
             continue
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
-        if cx < midx or cy < y_start or cy > y_end:
+        cx = (x0 + x1w) / 2.0
+        cy = (y0w + y1w) / 2.0
+        if cx < midx or cy < y0 or cy > y1:
             continue
-        pct_points.append((v, cx, cy))
+        pts.append((v, cx, cy))
 
-    # dedupe por valor
     uniq = []
-    for v, x, y in sorted(pct_points, key=lambda t: (t[0], t[2])):
+    for v, x, y in sorted(pts, key=lambda t: (t[0], t[2])):
         if all(abs(v - u[0]) > 0.2 for u in uniq):
             uniq.append((v, x, y))
 
@@ -199,10 +180,8 @@ def extract_bar_percentages(page: fitz.Page, bars: List[fitz.Rect], midx: float,
         bx = (r.x0 + r.x1) / 2.0
         best = None
         for (v, x, y) in uniq:
-            # debe estar sobre la barra
             if y >= r.y0:
                 continue
-            # ventana vertical razonable
             if y < r.y0 - 520:
                 continue
             dx = abs(x - bx)
@@ -212,75 +191,41 @@ def extract_bar_percentages(page: fitz.Page, bars: List[fitz.Rect], midx: float,
             if best is None or score < best[0]:
                 best = (score, v)
         out.append(best[1] if best else None)
-
     return out
 
-def classify_bar_color(rgb: Tuple[float, float, float]) -> str:
-    """
-    Clasificación robusta por color (SIN leyenda):
-    - gris = Igual
-    - celeste = Más seguro
-    - azul oscuro = Menos seguro
-    """
-    r, g, b = rgb
-
-    # "gris": canales parecidos y baja saturación
-    if abs(r - g) < 0.08 and abs(g - b) < 0.08:
-        return "igual"
-
-    h, s, v = colorsys.rgb_to_hsv(r, g, b)
-
-    # si saturación es muy baja, también gris
-    if s < 0.18:
-        return "igual"
-
-    # tonos azules: hue aprox 0.50 a 0.75
-    # (no lo forzamos demasiado; MPGP es azul/celeste)
-    # diferenciar celeste vs azul oscuro por "v" (brillo)
-    if v < 0.55:
-        return "menos"  # azul más oscuro
-    return "mas"        # celeste más brillante
-
-def extract_comp_comparison_by_bar_color(page: fitz.Page, midx: float, y_start: float, y_end: float) -> Dict[str, Optional[float]]:
-    bars = find_bar_rects(page, midx, y_start, y_end)
+def extract_comp_pdf(page: fitz.Page, midx: float, y0: float, y1: float) -> Dict[str, Optional[float]]:
+    bars = find_bar_rects_pdf(page, midx, y0, y1)
     if len(bars) != 3:
-        return {
-            "Comparación 2023 - Igual (%)": None,
-            "Comparación 2023 - Más seguro (%)": None,
-            "Comparación 2023 - Menos seguro (%)": None,
-        }
+        return {"igual": None, "mas": None, "menos": None}
 
-    bar_pcts = extract_bar_percentages(page, bars, midx, y_start, y_end)
+    pcts = extract_bar_pcts_pdf(page, bars, midx, y0, y1)
 
-    pix, zoom = render_page(page, zoom=2.0)
-
+    img, zoom = render_pdf_page(page, zoom=2.0)
     assigned = {"igual": None, "mas": None, "menos": None}
 
-    for r, pct in zip(bars, bar_pcts):
+    for r, pct in zip(bars, pcts):
         cx = (r.x0 + r.x1) / 2.0
-        # muestrear dentro, cerca del tercio superior (evita sombras)
         y_inside = r.y0 + (r.y1 - r.y0) * 0.35
-        rgb = sample_rgb(pix, cx * zoom, y_inside * zoom, radius=6)
-        cat = classify_bar_color(rgb)
 
-        # si por alguna razón dos barras caen en misma clase, guardamos la más "coherente":
-        # regla: si ya existe y el nuevo pct es None, no sobreescribir
+        px = int(cx * zoom)
+        py = int(y_inside * zoom)
+        px = max(0, min(img.shape[1] - 1, px))
+        py = max(0, min(img.shape[0] - 1, py))
+
+        # promedio local
+        patch = img[max(0, py-5):py+6, max(0, px-5):px+6, :]
+        mean = patch.mean(axis=(0, 1)) / 255.0
+        cat = classify_bar_color((float(mean[0]), float(mean[1]), float(mean[2])))
+
         if assigned[cat] is None or (assigned[cat] is not None and pct is not None):
             assigned[cat] = pct
 
-    return {
-        "Comparación 2023 - Igual (%)": assigned["igual"],
-        "Comparación 2023 - Más seguro (%)": assigned["mas"],
-        "Comparación 2023 - Menos seguro (%)": assigned["menos"],
-    }
+    return assigned
 
-
-# =========================
-# Extract principal (solo estos datos)
-# =========================
-def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float]]:
+def extract_from_pdf(file_bytes: bytes) -> Dict[str, Optional[float]]:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
     out = {
-        "Delegación": extract_delegacion(doc),
+        "Delegación": extract_delegacion_from_pdf(doc),
         "Seguro en la comunidad (%)": None,
         "Inseguro en la comunidad (%)": None,
         "Comparación 2023 - Igual (%)": None,
@@ -290,54 +235,178 @@ def extract_percepcion_ciudadana(doc: fitz.Document) -> Dict[str, Optional[float
 
     pidx = find_page_percepcion_ciudadana(doc)
     if pidx is None:
+        doc.close()
         return out
 
     page = doc[pidx]
+    y0 = page.rect.height * 0.16
+    y1 = page.rect.height * 0.92
+    midx = page.rect.width * 0.52
 
-    # Ventana amplia estable (incluye todo el bloque)
-    y_start = page.rect.height * 0.16
-    y_end   = page.rect.height * 0.92
-    midx    = page.rect.width  * 0.52
-
-    seguro, inseguro = extract_pie_seguro_inseguro(page, midx, y_start, y_end)
+    seguro, inseguro = extract_pie_from_pdf(page, midx, y0, y1)
     out["Seguro en la comunidad (%)"] = seguro
     out["Inseguro en la comunidad (%)"] = inseguro
 
-    out.update(extract_comp_comparison_by_bar_color(page, midx, y_start, y_end))
+    comp = extract_comp_pdf(page, midx, y0, y1)
+    out["Comparación 2023 - Igual (%)"] = comp["igual"]
+    out["Comparación 2023 - Más seguro (%)"] = comp["mas"]
+    out["Comparación 2023 - Menos seguro (%)"] = comp["menos"]
+
+    doc.close()
     return out
 
 
 # =========================
-# Streamlit UI
+# IMAGEN pipeline (OCR + color)
 # =========================
-st.set_page_config(page_title="MPGP - Extractor", layout="wide")
-st.title("MPGP — Extractor (Percepción ciudadana)")
+def ocr_percentages_image(img: np.ndarray) -> List[Tuple[float, float, float]]:
+    """
+    Devuelve lista de (pct, cx, cy) en coords de imagen.
+    Requiere Tesseract. Si no existe, lanza excepción controlada.
+    """
+    if not TESSERACT_OK:
+        raise RuntimeError("pytesseract no disponible")
 
-st.caption(
-    "Extrae: Seguro/Inseguro y Comparación 2023 (Igual, Más seguro, Menos seguro). "
-    "NO usa OCR. NO depende de la leyenda. Clasifica por color de barras."
+    pil = Image.fromarray(img)
+    try:
+        data = pytesseract.image_to_data(pil, output_type=pytesseract.Output.DICT, config="--psm 6")
+    except Exception as e:
+        # típico: TesseractNotFoundError
+        raise RuntimeError(str(e))
+
+    out = []
+    n = len(data["text"])
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        v = parse_pct(txt)
+        if v is None:
+            continue
+        x = data["left"][i]
+        y = data["top"][i]
+        w = data["width"][i]
+        h = data["height"][i]
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        out.append((v, cx, cy))
+    return out
+
+def mean_rgb_patch(img: np.ndarray, x: float, y: float, r: int = 6) -> Tuple[float, float, float]:
+    h, w, _ = img.shape
+    xi = int(max(0, min(w - 1, x)))
+    yi = int(max(0, min(h - 1, y)))
+    patch = img[max(0, yi-r):yi+r+1, max(0, xi-r):xi+r+1, :]
+    mean = patch.mean(axis=(0, 1)) / 255.0
+    return (float(mean[0]), float(mean[1]), float(mean[2]))
+
+def extract_from_image(img: np.ndarray) -> Dict[str, Optional[float]]:
+    """
+    Extrae los mismos campos desde una captura/imagen de la página.
+    Asume layout MPGP (pastel izq, barras der).
+    """
+    H, W, _ = img.shape
+    out = {
+        "Delegación": "DESDE_IMAGEN",
+        "Seguro en la comunidad (%)": None,
+        "Inseguro en la comunidad (%)": None,
+        "Comparación 2023 - Igual (%)": None,
+        "Comparación 2023 - Más seguro (%)": None,
+        "Comparación 2023 - Menos seguro (%)": None,
+    }
+
+    # OCR de porcentajes
+    pts = ocr_percentages_image(img)
+
+    # ventana vertical aproximada del bloque
+    y0 = H * 0.15
+    y1 = H * 0.92
+    midx = W * 0.52
+
+    # 1) Pastel: tomar 2 % del lado izquierdo
+    left = [v for (v, x, y) in pts if x < midx and y0 <= y <= y1]
+    uniq = []
+    for v in sorted(left, reverse=True):
+        if all(abs(v - u) > 0.2 for u in uniq):
+            uniq.append(v)
+        if len(uniq) == 2:
+            break
+    if len(uniq) == 2:
+        out["Inseguro en la comunidad (%)"] = max(uniq)
+        out["Seguro en la comunidad (%)"] = min(uniq)
+
+    # 2) Comparación: 3 % del lado derecho + clasificar por color (bajo cada %)
+    right = [(v, x, y) for (v, x, y) in pts if x >= midx and y0 <= y <= y1]
+
+    # quedarnos con 3 porcentajes más “grandes” en vertical (normalmente son 3)
+    # dedupe por valor
+    dedup = []
+    for v, x, y in sorted(right, key=lambda t: (t[0], t[2])):
+        if all(abs(v - u[0]) > 0.2 for u in dedup):
+            dedup.append((v, x, y))
+    # si hay más de 3, elegir 3 por estar más juntos arriba del gráfico (menor y)
+    if len(dedup) > 3:
+        dedup = sorted(dedup, key=lambda t: t[2])[:3]
+
+    assigned = {"igual": None, "mas": None, "menos": None}
+    for v, x, y in dedup[:3]:
+        # muestrear color “debajo” del % para caer dentro de la barra
+        y_in = y + (H * 0.10)
+        rgb = mean_rgb_patch(img, x, y_in, r=7)
+        cat = classify_bar_color(rgb)
+        assigned[cat] = v
+
+    out["Comparación 2023 - Igual (%)"] = assigned["igual"]
+    out["Comparación 2023 - Más seguro (%)"] = assigned["mas"]
+    out["Comparación 2023 - Menos seguro (%)"] = assigned["menos"]
+
+    return out
+
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="MPGP Extractor", layout="wide")
+st.title("Extractor MPGP — Percepción ciudadana (PDF o Imágenes)")
+
+st.info(
+    "✅ PDFs: funciona sin OCR.\n"
+    "✅ Imágenes: requiere OCR (Tesseract). Si no está instalado, la app te lo dirá y no se cae."
 )
 
 files = st.file_uploader(
-    "Suba uno o varios PDF",
-    type=["pdf"],
+    "Subí PDFs o imágenes (PNG/JPG). Podés subir muchos.",
+    type=["pdf", "png", "jpg", "jpeg"],
     accept_multiple_files=True
 )
 
+rows = []
+errors = []
+
 if files:
-    rows = []
     prog = st.progress(0)
     for i, f in enumerate(files, start=1):
-        doc = fitz.open(stream=f.read(), filetype="pdf")
-        data = extract_percepcion_ciudadana(doc)
-        doc.close()
-        rows.append({"Archivo": f.name, **data})
+        name = f.name
+        suffix = name.lower().split(".")[-1]
+
+        try:
+            if suffix == "pdf":
+                data = extract_from_pdf(f.read())
+            else:
+                img = Image.open(f).convert("RGB")
+                arr = np.array(img)
+                data = extract_from_image(arr)
+
+            rows.append({"Archivo": name, **data})
+
+        except Exception as e:
+            errors.append((name, str(e)))
+
         prog.progress(int(i / len(files) * 100))
     prog.empty()
 
+if rows:
     df = pd.DataFrame(rows)
 
-    # ordenar columnas como querés verlas
+    # orden
     cols = [
         "Archivo",
         "Delegación",
@@ -349,10 +418,10 @@ if files:
     ]
     df = df[[c for c in cols if c in df.columns]]
 
-    # Formato %
-    for col in cols[2:]:
-        if col in df.columns:
-            df[col] = df[col].map(fmt_pct)
+    # formato %
+    for c in cols[2:]:
+        if c in df.columns:
+            df[c] = df[c].map(fmt_pct)
 
     st.subheader("Resultados (tabla)")
     st.dataframe(df, use_container_width=True)
@@ -363,5 +432,15 @@ if files:
         file_name="percepcion_ciudadana.csv",
         mime="text/csv",
     )
-else:
-    st.info("Cargá PDFs para ver los resultados.")
+
+if errors:
+    st.subheader("Errores / Avisos")
+    for n, msg in errors:
+        st.write(f"- **{n}**: {msg}")
+
+    if any("tesseract" in m.lower() for _, m in errors) or (not TESSERACT_OK):
+        st.warning(
+            "Para procesar imágenes, necesitás Tesseract instalado.\n\n"
+            "Si estás en Streamlit Cloud, te recomiendo agregar un archivo **packages.txt** con:\n"
+            "`tesseract-ocr`\n"
+        )
